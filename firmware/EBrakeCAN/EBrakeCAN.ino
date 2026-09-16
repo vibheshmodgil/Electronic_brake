@@ -1,6 +1,11 @@
 #include <Arduino.h>
 #include "driver/twai.h"
 
+// Must come first: the Arduino IDE inserts its generated function
+// prototypes above the sketch body, so any type named in a function
+// signature has to be declared before them. See Telemetry.h.
+#include "Telemetry.h"
+
 // ============================================================
 // ESP32-S3 CAN configuration
 // Keep the pins and baud rate that already work.
@@ -116,8 +121,8 @@ unsigned long brakeStateChanges = 0;
 // constant gets believed over the code.
 //
 
-#define EVENT_SLOTS    8
-#define EVENT_TEXT_MAX 88
+// EVENT_SLOTS and EVENT_TEXT_MAX are in Telemetry.h - eventsSnapshot()
+// names EVENT_TEXT_MAX in its signature.
 
 static char eventText[EVENT_SLOTS][EVENT_TEXT_MAX];
 static uint32_t eventTime[EVENT_SLOTS];
@@ -198,23 +203,8 @@ uint8_t eventsSnapshot(
 // of one loop and half of the next.
 //
 
-struct BrakeSnapshot
-{
-  int32_t  rpm;
-  int32_t  s1_mV;
-  int32_t  s2_mV;
-  float    tps;
-  float    torque;
-  uint8_t  relayOn;
-  uint8_t  brakeApplied;
-  uint8_t  timerRunning;
-  uint32_t timerElapsedMs;
-  uint8_t  canValid;
-  int32_t  ageTpsMs;       // -1 = no frame has ever arrived
-  int32_t  ageRpmMs;
-  uint32_t uptimeMs;
-  uint32_t stateChanges;
-};
+// struct BrakeSnapshot is in Telemetry.h - snapshotGet() names it in its
+// signature, so it must be visible above the generated prototypes.
 
 static portMUX_TYPE snapshotMux = portMUX_INITIALIZER_UNLOCKED;
 static BrakeSnapshot snapshotShared;

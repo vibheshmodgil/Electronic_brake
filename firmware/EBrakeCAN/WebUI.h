@@ -2,8 +2,10 @@
 // WebUI.h - WiFi access point + read-only telemetry server
 // ============================================================
 //
-// Include this AFTER the telemetry snapshot and event log are defined in
-// EBrakeCAN.ino. It reads them; it never writes anything they depend on.
+// Include this after ENABLE_WEB_UI and the WEB_AP_* settings are defined
+// in EBrakeCAN.ino. The types it needs come from Telemetry.h, which it
+// includes itself. It reads the telemetry; it never writes anything the
+// brake logic depends on.
 //
 //
 // WHY THIS CANNOT SLOW THE BRAKE DOWN
@@ -46,6 +48,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 
+#include "Telemetry.h"
 #include "WebPage.h"
 
 static WebServer webServer(80);

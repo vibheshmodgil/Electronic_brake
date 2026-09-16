@@ -6,9 +6,18 @@ every input arrives as a CAN frame instead of an analogue voltage.
 ```
 firmware/EBrakeCAN/
 ├── EBrakeCAN.ino      the controller - CAN decoding and the state machine
+├── Telemetry.h        the snapshot struct shared by both sides
 ├── WebUI.h            WiFi access point + read-only telemetry server
 └── WebPage.h          the dashboard page, served from flash
 ```
+
+> **Why `Telemetry.h` exists.** The Arduino IDE hoists a generated prototype
+> for every `.ino` function to the top of the file, above your own code. Any
+> type or macro named in a function *signature* must therefore be declared in
+> a header included near the top, or the build fails with
+> `'BrakeSnapshot' was not declared in this scope`. `snapshotGet()` and
+> `eventsSnapshot()` both name one, so those declarations live here. If you
+> add a function that takes or returns a `BrakeSnapshot`, declare it here too.
 
 Uses only `Arduino.h`, the ESP-IDF `driver/twai.h`, and the `WiFi` /
 `WebServer` / `DNSServer` libraries that all ship with the ESP32 Arduino core
@@ -344,6 +353,7 @@ available where it was packaged. What *has* been checked here:
 | The server has no write route and never names the relay | Static parse |
 | The page fetches nothing external | Static parse |
 | The page renders and reflows at 320/390/768/1280/1600 px | Headless Chrome against a mock board serving this exact `WebPage.h` |
+| No function signature trips the Arduino prototype hoist | Static parse of every file-scope function against the types the sketch body declares |
 
 **None of that is a compile.** Build it before flashing, and commission with
 the brake mechanically disconnected.
