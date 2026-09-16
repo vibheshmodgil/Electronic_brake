@@ -1,0 +1,316 @@
+// ============================================================
+// WebPage.h - the dashboard, served from flash
+// ============================================================
+//
+// One self-contained page. No CDN, no external stylesheet, no chart
+// library, no web font.
+//
+// That is not a preference. A phone joined to this board's access point
+// has NO route to the internet, so anything fetched from a CDN simply
+// never loads and the page renders broken. Everything the dashboard needs
+// has to be in this string. Charts are drawn on a <canvas> by hand for
+// the same reason.
+//
+// ONE LAYOUT, THREE SHAPES
+// -------------------------------------------------------------------
+// The panels are a CSS grid whose column count changes with the width,
+// so the same markup serves a phone, a tablet and a laptop:
+//
+//   under 700px    2 columns   everything stacks, TPS and RPM side by side
+//   700 - 1100px   4 columns   charts sit two across
+//   over 1100px    6 columns   every card on one row, charts two across
+//
+// There is no separate mobile page to keep in step, and no user-agent
+// sniffing - it reflows on rotation and on a resized browser window.
+//
+// HISTORY LIVES IN THE BROWSER, not on the board: the page keeps its own
+// ring buffer and the board only ever sends the present moment. Firmware
+// RAM stays flat no matter how long a session runs, and the only cost is
+// that a device joining late starts with an empty chart.
+//
+// The thresholds drawn on the charts arrive in the JSON, from the same
+// constants the algorithm compares against. Nothing here hardcodes 5.0 or
+// 20 - the page cannot drift from the firmware.
+//
+#pragma once
+
+static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>EBrake Monitor</title>
+<style>
+:root{
+--bg:#0d1117;--panel:#161b22;--edge:#30363d;--grid:#283039;
+--fg:#e6edf3;--muted:#8b949e;--dim:#6e7681;
+--tps:#4ea3ff;--rpm:#3fb950;--red:#f85149;--green:#3fb950;
+--amber:#d29922;--ink:#0d1117;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+-webkit-text-size-adjust:100%}
+body{padding:10px 10px calc(14px + env(safe-area-inset-bottom))}
+.wrap{max-width:1500px;margin:0 auto}
+
+header{display:flex;align-items:baseline;justify-content:space-between;
+gap:10px;margin:2px 2px 4px}
+header h1{font-size:clamp(12px,3.4vw,15px);margin:0;letter-spacing:.06em}
+#link{font-size:clamp(10px,3vw,12px);font-weight:700;color:var(--dim);
+white-space:nowrap}
+#sub{font-size:10px;color:var(--dim);margin:0 2px 10px}
+
+/* one grid, three column counts */
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.grid>*{min-width:0}
+.card{background:var(--panel);border:1px solid var(--edge);border-radius:8px;
+padding:10px 12px}
+.b-banner,.b-gate,.b-can,.b-chart,.b-events{grid-column:span 2}
+.b-tps,.b-rpm{grid-column:span 1}
+@media(min-width:700px){
+  .grid{grid-template-columns:repeat(4,1fr);gap:10px}
+  .b-banner{grid-column:span 2}
+  .b-gate,.b-can,.b-chart{grid-column:span 2}
+  .b-events{grid-column:span 4}
+}
+@media(min-width:1100px){
+  .grid{grid-template-columns:repeat(6,1fr)}
+  .b-banner{grid-column:span 2}
+  .b-tps,.b-rpm,.b-gate,.b-can{grid-column:span 1}
+  .b-chart{grid-column:span 3}
+  .b-events{grid-column:span 6}
+}
+
+.k{font-size:10px;color:var(--muted);letter-spacing:.05em}
+.v{font-size:clamp(20px,5.5vw,26px);line-height:1.15;margin-top:2px}
+.s{font-size:10px;color:var(--muted);margin-top:3px}
+
+#banner{display:flex;flex-direction:column;justify-content:center;
+text-align:center;padding:14px 12px;transition:background .15s}
+#bstate{font-size:clamp(22px,6.5vw,30px);font-weight:700;letter-spacing:.03em}
+#bsub{font-size:11px;margin-top:3px;opacity:.85}
+
+.bar{height:9px;background:var(--grid);border-radius:5px;overflow:hidden;
+margin:8px 0 6px}
+.bar>i{display:block;height:100%;width:0;background:var(--amber);
+border-radius:5px;transition:width .12s linear}
+.chips{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:10px;color:var(--dim)}
+
+canvas{width:100%;height:120px;display:block;margin-top:4px}
+@media(min-width:700px){canvas{height:150px}}
+@media(min-width:1100px){canvas{height:190px}}
+
+#events div{font-size:10px;color:var(--muted);margin-top:4px;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stale{opacity:.45}
+.note{font-size:9px;color:var(--dim);margin:8px 2px 0}
+</style></head><body>
+<div class="wrap">
+
+<header><h1>EBRAKE MONITOR</h1><span id="link">CONNECTING</span></header>
+<div id="sub">&nbsp;</div>
+
+<div class="grid">
+
+  <div class="card b-banner" id="banner">
+    <div id="bstate">NO DATA</div>
+    <div id="bsub">waiting for the board</div>
+  </div>
+
+  <div class="card b-tps"><div class="k">TPS</div>
+    <div class="v" id="tps">--</div><div class="s" id="tpsS">&nbsp;</div></div>
+
+  <div class="card b-rpm"><div class="k">RPM</div>
+    <div class="v" id="rpm">--</div><div class="s" id="rpmS">&nbsp;</div></div>
+
+  <div class="card b-gate"><div class="k">APPLY GATE</div>
+    <div class="v" id="gate" style="font-size:19px">--</div>
+    <div class="bar"><i id="gbar"></i></div>
+    <div class="chips"><span id="c1"></span><span id="c2"></span></div></div>
+
+  <div class="card b-can"><div class="k">CAN LINK</div>
+    <div class="v" id="can" style="font-size:19px">--</div>
+    <div class="s" id="canS">&nbsp;</div></div>
+
+  <div class="card b-chart"><div class="k">TPS [%]</div>
+    <canvas id="cTps"></canvas></div>
+
+  <div class="card b-chart"><div class="k">SPEED [rpm]</div>
+    <canvas id="cRpm"></canvas></div>
+
+  <div class="card b-events" id="events"><div class="k">EVENTS</div></div>
+
+</div>
+
+<div class="note">History is kept by this device, so it starts empty on
+connect. Thresholds come from the firmware's own constants.</div>
+</div>
+
+<script>
+var N=200, hT=[], hR=[], hB=[], lastOk=0, cfg=null, evSig="";
+function $(i){return document.getElementById(i)}
+function push(a,v){a.push(v); if(a.length>N)a.shift()}
+
+function fit(c){
+  var r=c.getBoundingClientRect(), d=window.devicePixelRatio||1;
+  var w=Math.round(r.width*d), h=Math.round(r.height*d);
+  if(c.width!=w||c.height!=h){ c.width=w; c.height=h }
+  var x=c.getContext('2d'); x.setTransform(d,0,0,d,0,0);
+  return {x:x,w:r.width,h:r.height};
+}
+
+// data, colour, shaded band [lo,hi], values the axis must always include
+function chart(c,data,col,band,inc){
+  var g=fit(c), x=g.x, w=g.w, h=g.h, i;
+  x.clearRect(0,0,w,h);
+  if(!data.length){return}
+
+  var lo=Infinity, hi=-Infinity;
+  for(i=0;i<data.length;i++){ if(data[i]<lo)lo=data[i]; if(data[i]>hi)hi=data[i] }
+  for(i=0;i<inc.length;i++){ if(inc[i]<lo)lo=inc[i]; if(inc[i]>hi)hi=inc[i] }
+  var sp=hi-lo; if(sp<1e-6)sp=1;
+  lo-=sp*0.18; hi+=sp*0.18; sp=hi-lo;
+
+  var Y=function(v){ return h-(v-lo)/sp*h };
+  // newest sample sits at the right edge and older data runs left, so a
+  // partly filled buffer grows backwards instead of hanging off the left
+  var X=function(k){ return w-(data.length-1-k)/(N-1)*w };
+
+  // brake-applied shading, so the chart says when it was braked
+  x.fillStyle='rgba(248,81,73,.10)';
+  for(i=0;i<hB.length&&i<data.length;i++){
+    if(hB[i]){ var x0=X(i); x.fillRect(x0,0,Math.max(1,X(i+1)-x0),h) }
+  }
+
+  if(band){
+    x.fillStyle=col+'26';
+    x.fillRect(0,Y(band[1]),w,Math.max(1,Y(band[0])-Y(band[1])));
+    x.strokeStyle=col+'99'; x.lineWidth=1; x.setLineDash([4,3]);
+    [band[0],band[1]].forEach(function(v){
+      x.beginPath(); x.moveTo(0,Y(v)); x.lineTo(w,Y(v)); x.stroke() });
+    x.setLineDash([]);
+  }
+
+  x.strokeStyle=col; x.lineWidth=1.8; x.beginPath();
+  for(i=0;i<data.length;i++){
+    var px=X(i), py=Y(data[i]);
+    i?x.lineTo(px,py):x.moveTo(px,py);
+  }
+  x.stroke();
+
+  x.fillStyle='#6e7681'; x.font='9px monospace';
+  x.fillText(hi.toFixed(1),3,10); x.fillText(lo.toFixed(1),3,h-3);
+}
+
+function stale(on){
+  document.body.classList.toggle('stale',on);
+  if(on){
+    $('link').textContent='NO SIGNAL'; $('link').style.color='var(--red)';
+    $('banner').style.background='var(--panel)';
+    $('bstate').textContent='STALE'; $('bstate').style.color='var(--red)';
+    $('bsub').textContent='the board stopped answering';
+    $('bsub').style.color='var(--muted)';
+    $('can').textContent='?'; $('can').style.color='var(--dim)';
+    $('canS').textContent='unknown while the link is down';
+  }
+}
+
+function paint(d){
+  cfg=d;
+  $('link').textContent='LIVE'; $('link').style.color='var(--green)';
+  $('sub').textContent='up '+(d.uptime/1000).toFixed(0)+' s   '
+    +d.changes+' state changes';
+
+  var ap=d.brake===1;
+  $('banner').style.background=ap?'var(--red)':'var(--green)';
+  $('bstate').textContent=ap?'BRAKE APPLIED':'BRAKE RELEASED';
+  $('bstate').style.color='var(--ink)';
+  $('bsub').textContent=ap?'relay OFF - shaft held':'relay ON - shaft free';
+  $('bsub').style.color='var(--ink)';
+
+  var above=d.tps>=d.relTh, below=d.tps<d.appTh;
+  $('tps').textContent=d.tps.toFixed(2)+' %';
+  $('tps').style.color=above?'var(--amber)':'var(--tps)';
+  $('tpsS').textContent=above?('at/above release '+d.relTh.toFixed(1)+' %')
+    :(below?('below apply '+d.appTh.toFixed(1)+' %')
+           :('in band '+d.appTh.toFixed(1)+' - '+d.relTh.toFixed(1)+' %'));
+
+  var slow=Math.abs(d.rpm)<d.rpmTh;
+  $('rpm').textContent=d.rpm;
+  $('rpm').style.color=slow?'var(--rpm)':'var(--amber)';
+  $('rpmS').textContent=slow?('stopped   |rpm| < '+d.rpmTh)
+                            :('turning   |rpm| >= '+d.rpmTh);
+
+  if(ap){
+    $('gate').textContent='HELD'; $('gate').style.color='var(--muted)';
+    $('gbar').style.width='0%';
+    $('c1').textContent='releases at TPS >= '+d.relTh.toFixed(1)+' %';
+    $('c1').style.color='var(--dim)'; $('c2').textContent='';
+  }else{
+    if(d.timer===1){
+      $('gate').textContent=(d.timerMs/1000).toFixed(1)+' / '
+        +(d.delayMs/1000).toFixed(1)+' s';
+      $('gate').style.color='var(--amber)';
+      $('gbar').style.width=(100*d.timerMs/d.delayMs)+'%';
+    }else{
+      $('gate').textContent='open'; $('gate').style.color='var(--muted)';
+      $('gbar').style.width='0%';
+    }
+    $('c1').textContent=below?'TPS ok':'TPS high';
+    $('c1').style.color=below?'var(--green)':'var(--amber)';
+    $('c2').textContent=slow?'RPM ok':'RPM high';
+    $('c2').style.color=slow?'var(--green)':'var(--amber)';
+  }
+
+  $('can').textContent=d.canOk?'OK':'FAULT';
+  $('can').style.color=d.canOk?'var(--green)':'var(--red)';
+  $('canS').textContent='0x0B7 '+(d.ageTps<0?'never':d.ageTps+' ms')
+    +'   0x015 '+(d.ageRpm<0?'never':d.ageRpm+' ms')
+    +'   limit '+d.canTimeout+' ms';
+
+  push(hT,d.tps); push(hR,d.rpm); push(hB,ap?1:0);
+  redraw(d);
+}
+
+function redraw(d){
+  chart($('cTps'),hT,'#4ea3ff',[d.appTh,d.relTh],[0,d.relTh]);
+  chart($('cRpm'),hR,'#3fb950',[-d.rpmTh,d.rpmTh],[-d.rpmTh,d.rpmTh]);
+}
+
+function events(list){
+  var sig=JSON.stringify(list); if(sig===evSig)return; evSig=sig;
+  var box=$('events');
+  while(box.childNodes.length>1)box.removeChild(box.lastChild);
+  for(var i=list.length-1;i>=0;i--){
+    var e=document.createElement('div');
+    e.textContent=(list[i].t/1000).toFixed(1)+' s   '+list[i].m;
+    if(/CAN signals unavailable/.test(list[i].m))e.style.color='var(--red)';
+    box.appendChild(e);
+  }
+}
+
+function poll(){
+  var ac=new AbortController(), to=setTimeout(function(){ac.abort()},1200);
+  fetch('/api/status',{signal:ac.signal,cache:'no-store'})
+    .then(function(r){return r.json()})
+    .then(function(d){ clearTimeout(to); lastOk=Date.now();
+      document.body.classList.remove('stale'); paint(d) })
+    .catch(function(){ clearTimeout(to) })
+    .finally(function(){
+      if(Date.now()-lastOk>1500)stale(true);
+      setTimeout(poll,150) });
+}
+function pollEvents(){
+  fetch('/api/events',{cache:'no-store'}).then(function(r){return r.json()})
+    .then(events).catch(function(){}).finally(function(){
+      setTimeout(pollEvents,1000) });
+}
+
+// rotation and window resizes change the canvas size, so redraw from the
+// history we already hold rather than waiting for the next poll
+var rt=null;
+window.addEventListener('resize',function(){
+  clearTimeout(rt); rt=setTimeout(function(){ if(cfg)redraw(cfg) },120) });
+
+poll(); pollEvents();
+</script></body></html>)rawliteral";

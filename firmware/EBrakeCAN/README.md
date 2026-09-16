@@ -5,11 +5,14 @@ every input arrives as a CAN frame instead of an analogue voltage.
 
 ```
 firmware/EBrakeCAN/
-└── EBrakeCAN.ino      the entire controller
+├── EBrakeCAN.ino      the controller - CAN decoding and the state machine
+├── WebUI.h            WiFi access point + read-only telemetry server
+└── WebPage.h          the dashboard page, served from flash
 ```
 
-Single file. Uses only `Arduino.h` and the ESP-IDF `driver/twai.h` that ships
-with the ESP32 Arduino core — no external libraries.
+Uses only `Arduino.h`, the ESP-IDF `driver/twai.h`, and the `WiFi` /
+`WebServer` / `DNSServer` libraries that all ship with the ESP32 Arduino core
+— no external libraries.
 
 > **TWAI is CAN.** Espressif calls its controller TWAI (Two-Wire Automotive
 > Interface) for trademark reasons. It is CAN 2.0 and it talks to ordinary CAN
@@ -178,6 +181,11 @@ All at the top of the file.
 | `BRAKE_APPLY_DELAY_MS` | `1000` | The machine needs longer or shorter to settle |
 | `CAN_TIMEOUT_MS` | `500` | Your senders publish slower than 2 Hz |
 | `PRINT_INTERVAL_MS` | `100` | You want faster or slower telemetry |
+| `ENABLE_WEB_UI` | `1` | Set `0` to compile the WiFi dashboard out entirely |
+| `WEB_AP_SSID` / `WEB_AP_PASSWORD` | `EBrake-Monitor` / `brake1234` | Always — do not ship the default password |
+| `WEB_AP_CHANNEL` | `1` | The channel is congested where you are testing |
+| `WEB_AP_MAX_CLIENTS` | `4` | More or fewer devices need to watch at once |
+| `WEB_TASK_CORE` | `0` | Never, unless you have moved the Arduino loop |
 
 The bit rate is not a constant — it is the
 `TWAI_TIMING_CONFIG_500KBITS()` macro in `setup()`.
@@ -213,35 +221,129 @@ host-side observation only. See [../../tools/README.md](../../tools/README.md).
 
 ---
 
-## Known issues
+## Watching it on a phone
 
-### Stale text in two serial messages
+The board raises its own WiFi access point and serves a dashboard. Join the
+network, open the page, and you get the same picture as the desktop tool with
+no laptop, no cable and no serial monitor.
 
-The constants are correct; two printed strings disagree with them.
+| | |
+|---|---|
+| Network | `EBrake-Monitor` |
+| Password | `brake1234` — **change it**, `WEB_AP_PASSWORD` in the sketch |
+| Address | `http://192.168.4.1/` |
+
+Most phones offer a "sign in to network" notification that opens the page
+directly; any address you type lands there too, because unknown routes
+redirect to `/`.
+
+### One page, three shapes
+
+The panels are a CSS grid whose column count follows the width, so the same
+page suits whatever you open it on. It reflows on rotation and on a resized
+browser window — there is no separate mobile page to keep in step.
+
+| Width | Layout |
+|---|---|
+| under 700 px — phone | Single column, TPS and RPM side by side |
+| 700–1100 px — tablet | Four columns, charts two across |
+| over 1100 px — laptop | Every card on one row, charts two across |
+
+### What it shows
+
+The brake state, TPS, RPM, the apply gate and CAN link health, plus live
+charts and the firmware's recent event messages. Two things it can do that
+the serial dashboard cannot:
+
+- **The apply timer is real, not estimated.** The board reports its own
+  elapsed milliseconds, so the progress bar is the firmware's actual timer.
+  The serial dashboard has to reconstruct it from RUNNING/RESET.
+- **CAN frame ages are reported directly**, per message ID, against the
+  firmware's own `CAN_TIMEOUT_MS`. No inference.
+
+The thresholds drawn on the charts travel in the same JSON, taken from the
+constants the algorithm compares against — so the page cannot drift from the
+firmware the way a hardcoded copy would.
+
+History is kept by the browser, not the board: the ESP32 only ever sends the
+present moment. Firmware RAM stays flat however long a session runs, and the
+only cost is that a device joining late starts with an empty chart.
+
+### It cannot move the brake
+
+There are three routes — the page, `/api/status` and `/api/events`. All three
+are GET, and none of them touch the relay, the state machine or any constant.
+There is deliberately no endpoint that can release the brake, and adding one
+would put a WiFi client in the safety path.
+
+### It cannot slow the brake down either
+
+The server runs in its own FreeRTOS task pinned to **core 0**, beside the
+WiFi stack Arduino already puts there. The brake algorithm is the Arduino
+loop, which keeps **core 1** to itself. A stalled request, a phone that drops
+mid-transfer, four phones polling at once — none of it can delay
+`twai_receive()` or the apply timer. The two sides meet only at a spinlocked
+copy of a ~40-byte struct.
+
+If the access point fails to start, `webUiBegin()` says so on the serial port
+and returns; the controller then behaves exactly as if the web UI had been
+compiled out. `webUiBegin()` is also called **last** in `setup()`, so a WiFi
+problem cannot delay the brake reaching its fail-safe state or the CAN driver
+coming up.
+
+### Turning it off
 
 ```cpp
-if (latestTPSPercent >= TPS_RELEASE_THRESHOLD_PERCENT)   // 5.0
-    Serial.println("TPS >= 0%: relay ON, BRAKE RELEASED");   // prints 0%
+#define ENABLE_WEB_UI 0
 ```
 
-and:
+Compiles out the access point, the server and the page. **Do this for
+anything past bench testing.** A radio reaches beyond the walls of the room,
+the AP password is a default until you change it, and the brake does not need
+WiFi to work. Range is not security.
+
+---
+
+## Event messages, and the rule they now follow
+
+Every event goes through `logEvent()` / `logEventf()`, which prints to serial
+**and** keeps the last eight for the web UI. `logEventf()` formats each
+threshold from its constant:
 
 ```cpp
-Serial.println("TPS low and speed below 20 RPM: one-second timer started");
+logEventf("TPS >= %.1f %%: relay ON, BRAKE RELEASED",
+          (double)TPS_RELEASE_THRESHOLD_PERCENT);
 ```
 
-which hardcodes `20` rather than printing `RPM_APPLY_THRESHOLD`.
+This replaced two strings that disagreed with the code — one printed
+`"TPS >= 0%"` while the constant read `5.0f`, and one hardcoded
+`"below 20 RPM"` and `"one-second"`. The constants were always what ran, but
+this is exactly the failure the Mega sketch already had once, where printed
+text saying `"RPM < 10"` was believed over a constant reading `20.0f`.
 
-**The constants are what runs.** But this is exactly the failure the Mega sketch
-already had once — printed text saying `"RPM < 10"` while the constant read
-`20.0f`, and the text being believed over the code. The fix there was to print
-every threshold from its constant through a helper. See
+**If you add a message that mentions a threshold, use `logEventf()` and pass
+the constant.** Never type the number into the string. See
 [the single-source-of-truth rule](../README.md#the-single-source-of-truth-rule).
-Worth doing here too.
 
-### Verification status
+The text the host-side dashboard keys on — `CAN signals unavailable` — is
+unchanged, so `tools/can_brake_dashboard.py` still detects the fault.
+
+---
+
+## Verification status
 
 **Not compiled or hardware-tested in this repository** — no ESP32 toolchain was
-available where it was packaged. The host-side dashboard has been tested against
-this exact output format. Compile before flashing, and commission with the brake
-mechanically disconnected.
+available where it was packaged. What *has* been checked here:
+
+| Checked | How |
+|---|---|
+| Brace, paren and bracket balance across all three files | Static parse |
+| `/api/status` format string vs its 19 arguments | Static parse |
+| Every JSON key the page reads is one the firmware sends | Cross-check of both sides |
+| Every DOM id the script touches exists in the page | Cross-check |
+| The server has no write route and never names the relay | Static parse |
+| The page fetches nothing external | Static parse |
+| The page renders and reflows at 320/390/768/1280/1600 px | Headless Chrome against a mock board serving this exact `WebPage.h` |
+
+**None of that is a compile.** Build it before flashing, and commission with
+the brake mechanically disconnected.

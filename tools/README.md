@@ -150,6 +150,13 @@ More in [../docs/TROUBLESHOOTING.md](../docs/TROUBLESHOOTING.md#serial-and-dashb
 
 ## `can_brake_dashboard.py`
 
+> **You may not need this one.** The ESP32 build also serves its own
+> dashboard over WiFi — join `EBrake-Monitor` and open `http://192.168.4.1/`.
+> That needs no PC at all, and its apply timer and CAN frame ages are reported
+> by the board rather than inferred. Use the script below when you want the
+> CSV log, a bigger screen, or a record of the run. See
+> [../firmware/EBrakeCAN/README.md](../firmware/EBrakeCAN/README.md).
+
 The **ESP32-S3 / TWAI-CAN** build's dashboard. It shares `brake_dashboard.py`'s
 palette, autoscaling and reader-thread split, but the panels differ: this
 firmware gets everything over CAN instead of from its own ADC, and it publishes

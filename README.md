@@ -22,7 +22,7 @@ free to roll.
 |---|---|
 | [`firmware/ElectronicBrake/ElectronicBrake.ino`](firmware/ElectronicBrake/ElectronicBrake.ino) | The controller. The only thing that runs on the machine. |
 | [`firmware/platformio.ini`](firmware/platformio.ini) | PlatformIO build config. Arduino IDE also works — see [firmware/README.md](firmware/README.md). |
-| [`firmware/EBrakeCAN/EBrakeCAN.ino`](firmware/EBrakeCAN/EBrakeCAN.ino) | The ESP32-S3 / CAN variant of the controller. Same state machine, different inputs. |
+| [`firmware/EBrakeCAN/`](firmware/EBrakeCAN) | The ESP32-S3 / CAN variant of the controller. Same state machine, different inputs, plus a WiFi dashboard. |
 | [`tools/brake_dashboard.py`](tools/brake_dashboard.py) | Live PC dashboard and CSV logger over USB serial — **Mega build** |
 | [`tools/can_brake_dashboard.py`](tools/can_brake_dashboard.py) | Live PC dashboard and CSV logger — **ESP32-S3 CAN build** |
 | [`docs/HARDWARE.md`](docs/HARDWARE.md) | **Every component used**, what it does, and what the firmware assumes about it |
@@ -66,7 +66,22 @@ low for a full second. What differs is where those two numbers come from.
 | Settle time | 1000 ms | 1000 ms |
 | Relay | `D7`, active-low | `GPIO 7`, active-low |
 | Extra fail-safe | — | **CAN timeout**: no fresh frame for 500 ms applies the brake |
-| Dashboard | `tools/brake_dashboard.py` | `tools/can_brake_dashboard.py` |
+| Dashboard | `tools/brake_dashboard.py` over USB | `tools/can_brake_dashboard.py` over USB, **or a phone over WiFi** |
+
+### Watching the CAN build from a phone
+
+The ESP32 raises its own access point and serves a dashboard, so the bench
+needs no laptop and no cable:
+
+1. Join WiFi **`EBrake-Monitor`** (password `brake1234` — change it).
+2. Open **`http://192.168.4.1/`**.
+
+One page that reflows for a phone, a tablet or a laptop. It is **read-only** —
+no route on it can move the brake — and it runs on the core the brake loop does
+not use, so it cannot delay the algorithm. Compile it out with
+`ENABLE_WEB_UI 0` for anything past bench testing.
+
+Details in **[firmware/EBrakeCAN/README.md](firmware/EBrakeCAN/README.md)**.
 
 Two differences are worth knowing before comparing logs from the two:
 

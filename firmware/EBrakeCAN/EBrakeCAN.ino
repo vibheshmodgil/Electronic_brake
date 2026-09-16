@@ -24,6 +24,25 @@
 #define RELAY_OFF HIGH
 
 // ============================================================
+// Web UI
+// ============================================================
+//
+// Set to 0 to compile the access point and server out completely. Do
+// that for anything past bench testing: a radio reaches further than the
+// room, and the brake does not need WiFi to work.
+//
+#define ENABLE_WEB_UI 1
+
+#define WEB_AP_SSID        "EBrake-Monitor"
+#define WEB_AP_PASSWORD    "brake1234"   // WPA2 needs 8 characters. CHANGE IT.
+#define WEB_AP_CHANNEL     1
+#define WEB_AP_MAX_CLIENTS 4
+
+// Core 0 runs the WiFi stack already. The Arduino loop - and therefore
+// the brake algorithm - is on core 1 and stays there.
+#define WEB_TASK_CORE      0
+
+// ============================================================
 // Algorithm calibration
 // ============================================================
 const float TPS_RELEASE_THRESHOLD_PERCENT = 5.0f;
@@ -77,6 +96,139 @@ unsigned long brakeTimerStartTime = 0;
 bool canTimeoutReported = false;
 
 // ============================================================
+// Brake state changes, for telemetry
+// ============================================================
+
+unsigned long brakeStateChanges = 0;
+
+
+// ============================================================
+// Event log
+// ============================================================
+//
+// Every event goes to the serial port exactly as before, and into a
+// small ring so the web UI can show the same history to a phone that
+// joined after the fact.
+//
+// logEventf() formats the thresholds from the constants themselves. That
+// is the rule the Mega sketch already follows, for the reason documented
+// in firmware/README.md: a printed threshold that disagrees with the
+// constant gets believed over the code.
+//
+
+#define EVENT_SLOTS    8
+#define EVENT_TEXT_MAX 88
+
+static char eventText[EVENT_SLOTS][EVENT_TEXT_MAX];
+static uint32_t eventTime[EVENT_SLOTS];
+static uint8_t eventHead = 0;
+static uint8_t eventCount = 0;
+
+static portMUX_TYPE eventMux = portMUX_INITIALIZER_UNLOCKED;
+
+
+void logEvent(const char *message)
+{
+  Serial.println(message);
+
+  uint32_t now = millis();
+
+  portENTER_CRITICAL(&eventMux);
+
+  strncpy(eventText[eventHead], message, EVENT_TEXT_MAX - 1);
+  eventText[eventHead][EVENT_TEXT_MAX - 1] = '\0';
+  eventTime[eventHead] = now;
+
+  eventHead = (uint8_t)((eventHead + 1) % EVENT_SLOTS);
+
+  if (eventCount < EVENT_SLOTS)
+  {
+    eventCount++;
+  }
+
+  portEXIT_CRITICAL(&eventMux);
+}
+
+
+void logEventf(const char *format, ...)
+{
+  char buffer[EVENT_TEXT_MAX];
+
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  logEvent(buffer);
+}
+
+
+// Oldest first. Returns how many were copied.
+uint8_t eventsSnapshot(
+    char out[][EVENT_TEXT_MAX],
+    uint32_t *times,
+    uint8_t maximum)
+{
+  portENTER_CRITICAL(&eventMux);
+
+  uint8_t n = eventCount < maximum ? eventCount : maximum;
+
+  for (uint8_t i = 0; i < n; i++)
+  {
+    uint8_t index =
+        (uint8_t)((eventHead + EVENT_SLOTS - n + i) % EVENT_SLOTS);
+
+    memcpy(out[i], eventText[index], EVENT_TEXT_MAX);
+    times[i] = eventTime[index];
+  }
+
+  portEXIT_CRITICAL(&eventMux);
+
+  return n;
+}
+
+
+// ============================================================
+// Telemetry snapshot
+// ============================================================
+//
+// The only thing the web server is allowed to see. Published by the
+// brake loop on core 1, read by the server task on core 0, handed over
+// under a spinlock as one struct copy so a phone can never observe half
+// of one loop and half of the next.
+//
+
+struct BrakeSnapshot
+{
+  int32_t  rpm;
+  int32_t  s1_mV;
+  int32_t  s2_mV;
+  float    tps;
+  float    torque;
+  uint8_t  relayOn;
+  uint8_t  brakeApplied;
+  uint8_t  timerRunning;
+  uint32_t timerElapsedMs;
+  uint8_t  canValid;
+  int32_t  ageTpsMs;       // -1 = no frame has ever arrived
+  int32_t  ageRpmMs;
+  uint32_t uptimeMs;
+  uint32_t stateChanges;
+};
+
+static portMUX_TYPE snapshotMux = portMUX_INITIALIZER_UNLOCKED;
+static BrakeSnapshot snapshotShared;
+
+
+void snapshotGet(BrakeSnapshot *out)
+{
+  portENTER_CRITICAL(&snapshotMux);
+  *out = snapshotShared;
+  portEXIT_CRITICAL(&snapshotMux);
+}
+
+
+// ============================================================
 // Decode signed 16-bit Motorola/big-endian value
 // ============================================================
 int16_t readSigned16BigEndian(
@@ -98,6 +250,13 @@ void commandBrakeApplied()
   // HL-52S HIGH = relay OFF.
   digitalWrite(RELAY_PIN, RELAY_OFF);
 
+  // Count transitions only. The CAN-fault path calls this every pass,
+  // and a counter that ticked each time would be meaningless.
+  if (brakeState != BRAKE_APPLIED)
+  {
+    brakeStateChanges++;
+  }
+
   brakeState = BRAKE_APPLIED;
   brakeTimerRunning = false;
 }
@@ -106,6 +265,11 @@ void commandBrakeReleased()
 {
   // HL-52S LOW = relay ON.
   digitalWrite(RELAY_PIN, RELAY_ON);
+
+  if (brakeState != BRAKE_RELEASED)
+  {
+    brakeStateChanges++;
+  }
 
   brakeState = BRAKE_RELEASED;
   brakeTimerRunning = false;
@@ -207,8 +371,7 @@ void updateBrakeAlgorithm()
   {
     if (!canTimeoutReported)
     {
-      Serial.println(
-          "CAN signals unavailable: commanding relay OFF");
+      logEvent("CAN signals unavailable: commanding relay OFF");
 
       canTimeoutReported = true;
     }
@@ -243,8 +406,9 @@ void updateBrakeAlgorithm()
     {
       commandBrakeReleased();
 
-      Serial.println(
-          "TPS >= 0%: relay ON, BRAKE RELEASED");
+      logEventf(
+          "TPS >= %.1f %%: relay ON, BRAKE RELEASED",
+          (double)TPS_RELEASE_THRESHOLD_PERCENT);
     }
 
     return;
@@ -273,8 +437,7 @@ void updateBrakeAlgorithm()
   {
     if (brakeTimerRunning)
     {
-      Serial.println(
-          "Apply condition interrupted: timer reset");
+      logEvent("Apply condition interrupted: timer reset");
     }
 
     brakeTimerRunning = false;
@@ -287,9 +450,11 @@ void updateBrakeAlgorithm()
     brakeTimerRunning = true;
     brakeTimerStartTime = now;
 
-    Serial.println(
-        "TPS low and speed below 20 RPM: "
-        "one-second timer started");
+    logEventf(
+        "TPS < %.1f %% and |RPM| < %d: %lu ms timer started",
+        (double)TPS_APPLY_THRESHOLD_PERCENT,
+        (int)RPM_APPLY_THRESHOLD,
+        (unsigned long)BRAKE_APPLY_DELAY_MS);
 
     return;
   }
@@ -300,9 +465,9 @@ void updateBrakeAlgorithm()
   {
     commandBrakeApplied();
 
-    Serial.println(
-        "Conditions true for 1 second: "
-        "relay OFF, BRAKE APPLIED");
+    logEventf(
+        "Conditions held %lu ms: relay OFF, BRAKE APPLIED",
+        (unsigned long)BRAKE_APPLY_DELAY_MS);
   }
 }
 
@@ -350,6 +515,73 @@ void printStatus()
       brakeText,
       brakeTimerRunning ? "RUNNING" : "RESET");
 }
+
+// ============================================================
+// Publish the snapshot
+// ============================================================
+//
+// Called once per loop from core 1. The critical section is one struct
+// copy: long enough to be atomic, short enough to be invisible.
+//
+void publishSnapshot()
+{
+#if ENABLE_WEB_UI
+
+  uint32_t now = millis();
+
+  BrakeSnapshot s;
+
+  s.rpm    = (int32_t)latestRPM;
+  s.s1_mV  = (int32_t)latestAccPedS1_mV;
+  s.s2_mV  = (int32_t)latestAccPedS2_mV;
+  s.tps    = latestTPSPercent;
+  s.torque = latestTorqueRequestNm;
+
+  s.relayOn      = (brakeState == BRAKE_RELEASED) ? 1 : 0;
+  s.brakeApplied = (brakeState == BRAKE_APPLIED) ? 1 : 0;
+
+  s.timerRunning = brakeTimerRunning ? 1 : 0;
+
+  // The board knows the real elapsed time, so the phone shows it rather
+  // than reconstructing it the way the serial dashboard has to.
+  uint32_t elapsed = 0;
+
+  if (brakeTimerRunning)
+  {
+    elapsed = now - brakeTimerStartTime;
+
+    if (elapsed > BRAKE_APPLY_DELAY_MS)
+    {
+      elapsed = BRAKE_APPLY_DELAY_MS;
+    }
+  }
+
+  s.timerElapsedMs = elapsed;
+
+  s.canValid = requiredCANSignalsValid() ? 1 : 0;
+
+  s.ageTpsMs = tpsFrameReceived
+                   ? (int32_t)(now - lastTPSFrameTime)
+                   : -1;
+
+  s.ageRpmMs = rpmFrameReceived
+                   ? (int32_t)(now - lastRPMFrameTime)
+                   : -1;
+
+  s.uptimeMs     = now;
+  s.stateChanges = brakeStateChanges;
+
+  portENTER_CRITICAL(&snapshotMux);
+  snapshotShared = s;
+  portEXIT_CRITICAL(&snapshotMux);
+
+#endif
+}
+
+
+// Needs the snapshot and the event log above it.
+#include "WebUI.h"
+
 
 // ============================================================
 // Setup
@@ -417,6 +649,10 @@ void setup()
   }
 
   Serial.println("TWAI driver started.");
+
+  // Last, so a WiFi problem cannot delay the brake reaching its
+  // fail-safe state or the CAN driver coming up.
+  webUiBegin();
 }
 
 // ============================================================
@@ -451,5 +687,6 @@ void loop()
   }
 
   updateBrakeAlgorithm();
+  publishSnapshot();
   printStatus();
 }

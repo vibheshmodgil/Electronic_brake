@@ -9,6 +9,8 @@ firmware/
 │   └── ElectronicBrake.ino               Mega 2560 build - analogue inputs
 └── EBrakeCAN/
     ├── EBrakeCAN.ino                     ESP32-S3 build - CAN inputs
+    ├── WebUI.h                           WiFi AP + read-only telemetry server
+    ├── WebPage.h                         the phone/laptop dashboard page
     └── README.md                         its pins, CAN decoding and constants
 ```
 
@@ -28,6 +30,7 @@ second. They differ in where those two numbers come from.
 | Relay | `D7`, active-low | `GPIO 7`, active-low |
 | Extra fail-safe | — | **CAN timeout** — 500 ms of silence applies the brake |
 | Dashboard | [`tools/brake_dashboard.py`](../tools/brake_dashboard.py) | [`tools/can_brake_dashboard.py`](../tools/can_brake_dashboard.py) |
+| Live view without a PC | — | **WiFi AP + web dashboard**, read-only, on the spare core |
 
 The CAN build has its own README: **[EBrakeCAN/README.md](EBrakeCAN/README.md)**.
 Everything below this line is about the **Mega build**.
