@@ -5,9 +5,20 @@ watching and recording what the firmware is doing.
 
 ```
 tools/
-├── brake_dashboard.py     live dashboard + CSV logger
+├── brake_dashboard.py       live dashboard + CSV logger  (Arduino Mega, analogue)
+├── can_brake_dashboard.py   live dashboard + CSV logger  (ESP32-S3, CAN)
 └── requirements.txt
 ```
+
+**Two dashboards, one per firmware.** They are deliberately separate files
+rather than one script with a `--mode` flag: the two boards publish different
+signals, so a merged parser would be mostly branches. Pick the one that matches
+the board on the bench.
+
+| Firmware | Dashboard | Signal source |
+|---|---|---|
+| [`firmware/ElectronicBrake`](../firmware/ElectronicBrake) (Mega 2560) | `brake_dashboard.py` | Analogue: sin/cos encoder + hall throttle |
+| [`firmware/EBrakeCAN`](../firmware/EBrakeCAN) (ESP32-S3) | `can_brake_dashboard.py` | CAN frames `0x015` and `0x0B7` |
 
 ---
 
@@ -133,3 +144,111 @@ If nothing parsed, the script says why rather than just ending:
 | `Lines arrived but did not match` | Format changed — it prints the first few lines |
 
 More in [../docs/TROUBLESHOOTING.md](../docs/TROUBLESHOOTING.md#serial-and-dashboard).
+
+
+---
+
+## `can_brake_dashboard.py`
+
+Same dashboard for the **ESP32-S3 / TWAI-CAN** build. The layout, colours,
+autoscaling and threading are identical to `brake_dashboard.py`; only the inputs
+differ, because this firmware gets everything over CAN instead of from its own
+ADC.
+
+Five panels:
+
+| Panel | Shows |
+|---|---|
+| **Brake banner** | APPLIED / RELEASED, large. Red = applied, green = released. |
+| **TPS** | Throttle position [%], with **both** thresholds — release and apply |
+| **RPM** | Shaft speed from CAN `0x015`, with the ± threshold band |
+| **Pedal / torque** | Raw accelerator sensors S1 and S2 [mV] plus torque request [Nm] |
+| **CAN link** | OK or FAULT, with the time the link was lost |
+| **Brake strip** | A dedicated APPLIED/RELEASED timeline along the bottom |
+
+### What it reads
+
+The status line from `printStatus()`:
+
+```
+RPM: -12 | S1: 820 mV | S2: 815 mV | TPS: 4.32 % | Torque: 0.00 Nm | Relay: OFF | Brake: APPLIED | Timer: RESET
+```
+
+A line needs **both** `RPM:` and `TPS:` to count as a data row. Everything else
+— the startup banner, the state-change messages, the CAN-fault notice — is
+captured as an event and printed on exit.
+
+### Two values the firmware does not send
+
+Both are reconstructed on this end, and both are labelled as such in the UI:
+
+**Timer progress.** The sketch prints only `Timer: RUNNING` or `Timer: RESET`,
+never the elapsed milliseconds. The dashboard times the RUNNING stretch itself,
+from the first RUNNING line to the last, clamped to `--brake-ms`. It is drawn
+**dashed** to mark it as an estimate. Its resolution is the 100 ms print
+interval, so expect it to read up to 100 ms low.
+
+**CAN health.** The sketch announces `CAN signals unavailable` once on entering
+the fault and says nothing at all on recovery. So the CAN card turns red on that
+message, and clears again as soon as any decoded value changes — which can only
+happen if fresh frames are being decoded. At a genuine standstill with a dead
+link it stays red, which is correct. It is an inference, not a device reading.
+
+### Run
+
+```bash
+# auto-detect the port
+python can_brake_dashboard.py
+
+# name it explicitly
+python can_brake_dashboard.py --port COM5
+
+# log somewhere specific, 60-second window
+python can_brake_dashboard.py --port COM5 --csv run_can.csv --window 60
+
+# no hardware needed - synthetic data, including a periodic CAN dropout
+python can_brake_dashboard.py --demo
+```
+
+Auto-detect prefers ports whose description mentions *esp32*, *cp210*, *ch340*
+or *jtag*. On an ESP32-S3 using **native USB CDC** the port disappears and
+reappears across a reset — if nothing arrives, reset the board, then start the
+dashboard.
+
+### Options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--port` | auto-detect | Serial port, e.g. `COM5` or `/dev/ttyACM0` |
+| `--baud` | `115200` | Must match `Serial.begin()` in the sketch |
+| `--csv` | `esp32_can_log.csv` | Log file. Overwritten each run. |
+| `--window` | `30` | Seconds of history visible |
+| `--tps-release` | `5.0` | Drawn as the release line — `TPS_RELEASE_THRESHOLD_PERCENT` |
+| `--tps-apply` | `4.5` | Drawn as the apply line — `TPS_APPLY_THRESHOLD_PERCENT` |
+| `--rpm-threshold` | `20` | Drawn as the ± band — `RPM_APPLY_THRESHOLD` |
+| `--brake-ms` | `1000` | Full scale for the timer trace — `BRAKE_APPLY_DELAY_MS` |
+| `--echo` | off | Print every received line — use when parsing fails |
+| `--demo` | off | Synthetic data, no serial port opened |
+
+> **The threshold flags are display only**, exactly as in the Mega dashboard.
+> They draw reference lines; the ESP32 uses its own compiled-in constants. Change
+> one in the sketch and you must pass the matching flag, or the plot shows a line
+> the firmware is not using.
+
+### CSV output
+
+One row per received status line:
+
+| Column | Meaning |
+|---|---|
+| `t_s` | Seconds since the first parsed line (PC clock) |
+| `rpm` | Signed shaft speed, CAN `0x015` bytes 3–4 |
+| `s1_mV`, `s2_mV` | Accelerator sensors 1 and 2 |
+| `tps_pct` | Throttle position |
+| `torque_Nm` | Torque request |
+| `relay_on` | 1 = energised |
+| `brake_applied` | 1 = applied. Inverse of `relay_on`. |
+| `timer_running` | 1 while the apply timer counts |
+| `timer_ms_est` | Reconstructed timer elapsed — see above, an estimate |
+
+Flushed once a second, so a log survives an unclean exit.

@@ -22,7 +22,9 @@ free to roll.
 |---|---|
 | [`firmware/ElectronicBrake/ElectronicBrake.ino`](firmware/ElectronicBrake/ElectronicBrake.ino) | The controller. The only thing that runs on the machine. |
 | [`firmware/platformio.ini`](firmware/platformio.ini) | PlatformIO build config. Arduino IDE also works — see [firmware/README.md](firmware/README.md). |
-| [`tools/brake_dashboard.py`](tools/brake_dashboard.py) | Live PC dashboard and CSV logger over USB serial |
+| [`firmware/EBrakeCAN/EBrakeCAN.ino`](firmware/EBrakeCAN/EBrakeCAN.ino) | The ESP32-S3 / CAN variant of the controller. Same state machine, different inputs. |
+| [`tools/brake_dashboard.py`](tools/brake_dashboard.py) | Live PC dashboard and CSV logger over USB serial — **Mega build** |
+| [`tools/can_brake_dashboard.py`](tools/can_brake_dashboard.py) | Live PC dashboard and CSV logger — **ESP32-S3 CAN build** |
 | [`docs/HARDWARE.md`](docs/HARDWARE.md) | **Every component used**, what it does, and what the firmware assumes about it |
 | [`docs/WIRING.md`](docs/WIRING.md) | Pin-by-pin connection tables, power and grounding |
 | [`docs/CONTROL_LOGIC.md`](docs/CONTROL_LOGIC.md) | The state machine and the RPM maths, derived in full |
@@ -44,6 +46,39 @@ restarts the wait from zero.
 
 The full state machine, including every transition and its timing, is in
 **[docs/CONTROL_LOGIC.md](docs/CONTROL_LOGIC.md)**.
+
+---
+
+## Two builds, one state machine
+
+There are two controllers in this repo. The braking rule is identical in both —
+release on throttle, re-apply only after throttle **and** speed have both stayed
+low for a full second. What differs is where those two numbers come from.
+
+| | Mega build | CAN build |
+|---|---|---|
+| Sketch | `firmware/ElectronicBrake` | `firmware/EBrakeCAN` |
+| Board | Arduino Mega 2560 | ESP32-S3 + TJA1050 transceiver |
+| Speed from | Differential sin/cos encoder on `A0`–`A3`, angle differentiated | CAN ID `0x015`, signed 16-bit, bytes 3–4 |
+| Throttle from | Hall throttle on `A4`, read as **volts** | CAN ID `0x0B7`, read as **percent** |
+| Release / apply | 0.80 V / 0.80 V — no hysteresis | 5.0 % / 4.5 % — 0.5 % hysteresis |
+| Speed threshold | 20 rpm | 20 rpm |
+| Settle time | 1000 ms | 1000 ms |
+| Relay | `D7`, active-low | `GPIO 7`, active-low |
+| Extra fail-safe | — | **CAN timeout**: no fresh frame for 500 ms applies the brake |
+| Dashboard | `tools/brake_dashboard.py` | `tools/can_brake_dashboard.py` |
+
+Two differences are worth knowing before comparing logs from the two:
+
+**The CAN build has real hysteresis, the Mega build does not.** 5.0 % to release
+and 4.5 % to re-arm means a pedal resting on the threshold cannot chatter the
+relay. The Mega's 0.80 V / 0.80 V can.
+
+**The CAN build fails safe on a silent bus.** `requiredCANSignalsValid()`
+applies the brake if either required frame is more than 500 ms old, or if
+either has never arrived at all — so a dead bus, an unplugged transceiver or a
+sender that stops all end with the brake on. The Mega has no equivalent, because
+its sensors are wired directly to its own ADC.
 
 ---
 

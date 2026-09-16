@@ -4,13 +4,33 @@ The controller. This is the only code that runs on the machine.
 
 ```
 firmware/
-├── platformio.ini                        PlatformIO build config
-└── ElectronicBrake/
-    └── ElectronicBrake.ino               the entire controller
+├── platformio.ini                        PlatformIO build config (Mega)
+├── ElectronicBrake/
+│   └── ElectronicBrake.ino               Mega 2560 build - analogue inputs
+└── EBrakeCAN/
+    ├── EBrakeCAN.ino                     ESP32-S3 build - CAN inputs
+    └── README.md                         its pins, CAN decoding and constants
 ```
 
-Single file, no external libraries, no dynamic allocation, no interrupts. It uses
-only `Arduino.h` and `math.h`.
+**Two builds, one braking rule.** Both release the brake on throttle and
+re-apply it only after throttle *and* speed have stayed low for a continuous
+second. They differ in where those two numbers come from.
+
+| | Mega build | CAN build |
+|---|---|---|
+| Directory | `ElectronicBrake/` | `EBrakeCAN/` |
+| Board | Arduino Mega 2560 | ESP32-S3 + TJA1050 transceiver |
+| Speed from | Differential sin/cos encoder on `A0`–`A3` | CAN `0x015`, signed 16-bit |
+| Throttle from | Hall throttle on `A4`, in **volts** | CAN `0x0B7`, in **percent** |
+| Release / apply | 0.80 V / 0.80 V — no hysteresis | 5.0 % / 4.5 % — 0.5 % hysteresis |
+| Speed threshold | 20 rpm | 20 rpm |
+| Settle time | 1000 ms | 1000 ms |
+| Relay | `D7`, active-low | `GPIO 7`, active-low |
+| Extra fail-safe | — | **CAN timeout** — 500 ms of silence applies the brake |
+| Dashboard | [`tools/brake_dashboard.py`](../tools/brake_dashboard.py) | [`tools/can_brake_dashboard.py`](../tools/can_brake_dashboard.py) |
+
+The CAN build has its own README: **[EBrakeCAN/README.md](EBrakeCAN/README.md)**.
+Everything below this line is about the **Mega build**.
 
 ---
 
