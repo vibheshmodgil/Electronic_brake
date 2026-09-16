@@ -150,21 +150,58 @@ More in [../docs/TROUBLESHOOTING.md](../docs/TROUBLESHOOTING.md#serial-and-dashb
 
 ## `can_brake_dashboard.py`
 
-Same dashboard for the **ESP32-S3 / TWAI-CAN** build. The layout, colours,
-autoscaling and threading are identical to `brake_dashboard.py`; only the inputs
-differ, because this firmware gets everything over CAN instead of from its own
-ADC.
+The **ESP32-S3 / TWAI-CAN** build's dashboard. It shares `brake_dashboard.py`'s
+palette, autoscaling and reader-thread split, but the panels differ: this
+firmware gets everything over CAN instead of from its own ADC, and it publishes
+signals the Mega build has no equivalent for.
 
-Five panels:
+### Layout
 
-| Panel | Shows |
+A header row of status cards, four stacked time plots sharing one time axis, and
+a live event log.
+
+| | Shows |
 |---|---|
-| **Brake banner** | APPLIED / RELEASED, large. Red = applied, green = released. |
-| **TPS** | Throttle position [%], with **both** thresholds — release and apply |
-| **RPM** | Shaft speed from CAN `0x015`, with the ± threshold band |
-| **Pedal / torque** | Raw accelerator sensors S1 and S2 [mV] plus torque request [Nm] |
-| **CAN link** | OK or FAULT, with the time the link was lost |
-| **Brake strip** | A dedicated APPLIED/RELEASED timeline along the bottom |
+| **BRAKE** banner | APPLIED / RELEASED, large, with the relay state and a running count of state changes |
+| **TPS** card | Throttle position, and which side of the hysteresis band it is on |
+| **RPM** card | Shaft speed, and whether it counts as stopped |
+| **APPLY GATE** card | *Why the brake has not engaged yet* — see below |
+| **CAN LINK** card | OK / FAULT / unknown |
+| **TPS** plot | Throttle [%], with the hysteresis band shaded amber |
+| **RPM** plot | Speed from CAN `0x015`, with the stopped deadband shaded green |
+| **PEDAL** plot | Sensors S1 and S2 [mV], plus the torque request [Nm] on the right axis |
+| **BRAKE** strip | An APPLIED/RELEASED timeline, with the apply timer filling it as an amber wedge |
+| **EVENTS** | The firmware's own messages as they arrive, CAN faults in red |
+
+All four plots share one time axis, so a moment can be traced vertically through
+every signal. Brake-applied regions are shaded faintly red behind each trace.
+
+### The apply gate
+
+The most useful panel when commissioning. When the brake is released, the
+question is always *what is stopping it from engaging* — and the answer is one
+of exactly three things. The card shows all of them:
+
+- two condition chips, **TPS ok/high** and **RPM ok/high**, so the blocking
+  condition is named rather than inferred;
+- a progress bar and a `0.6/1.0 s` readout once both conditions hold and the
+  firmware's timer is counting.
+
+When the brake is already applied the card reads **HELD**, and tells you the
+throttle level that would release it.
+
+### Two link indicators, and they are not the same thing
+
+| Indicator | Link | Meaning |
+|---|---|---|
+| **LIVE / SERIAL STALE** (top right) | host ↔ board | Status lines have stopped arriving |
+| **CAN LINK** card | board ↔ bus | Mirrors the firmware's own 500 ms frame timeout |
+
+This distinction matters. A frozen plot looks identical to a quiet one, so when
+no status line has arrived for 1.5 s the badge turns red, the banner goes neutral
+grey and reads **STALE**, and every card dims and relabels itself *last value* —
+because at that point nothing on screen is current. The CAN card goes to `?`,
+since with no telemetry the state of the bus is genuinely unknown.
 
 ### What it reads
 
@@ -176,23 +213,34 @@ RPM: -12 | S1: 820 mV | S2: 815 mV | TPS: 4.32 % | Torque: 0.00 Nm | Relay: OFF 
 
 A line needs **both** `RPM:` and `TPS:` to count as a data row. Everything else
 — the startup banner, the state-change messages, the CAN-fault notice — is
-captured as an event and printed on exit.
+captured as an event, shown in the log panel and printed again on exit.
 
-### Two values the firmware does not send
+Events and status lines are merged and **replayed in timestamp order**. Handling
+all events first would let a value change from *before* a CAN fault clear that
+fault immediately, because a single read can span the moment the link dropped.
 
-Both are reconstructed on this end, and both are labelled as such in the UI:
+### Three values the firmware does not send
+
+All three are reconstructed host-side, and all three are marked in the UI rather
+than presented as device readings.
 
 **Timer progress.** The sketch prints only `Timer: RUNNING` or `Timer: RESET`,
-never the elapsed milliseconds. The dashboard times the RUNNING stretch itself,
-from the first RUNNING line to the last, clamped to `--brake-ms`. It is drawn
-**dashed** to mark it as an estimate. Its resolution is the 100 ms print
-interval, so expect it to read up to 100 ms low.
+never the elapsed milliseconds. The dashboard times the RUNNING stretch itself
+and clamps it to `--brake-ms`. Its resolution is the sketch's 100 ms print
+interval, so expect it to read up to 100 ms low. The card is headed `est.`
 
 **CAN health.** The sketch announces `CAN signals unavailable` once on entering
-the fault and says nothing at all on recovery. So the CAN card turns red on that
-message, and clears again as soon as any decoded value changes — which can only
-happen if fresh frames are being decoded. At a genuine standstill with a dead
-link it stays red, which is correct. It is an inference, not a device reading.
+the fault and says nothing at all on recovery. So the card turns red on that
+message and clears again only when a decoded value changes, which can happen
+only if fresh frames are arriving. Values frozen at their last decoded reading
+keep it red — correct, because that is exactly what a dead link looks like.
+
+**Pedal deviation.** `|S1 - S2|` is shown in the pedal panel because a
+dual-sensor accelerator is redundant by design, and a split between the two
+sensors means one is failing. **The firmware does not check this** — it decodes
+both sensors but compares neither. The readout is labelled *(not checked by
+firmware)* so it can never be mistaken for an interlock, and it turns amber past
+200 mV purely as a prompt to go and look.
 
 ### Run
 

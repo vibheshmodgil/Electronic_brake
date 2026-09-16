@@ -201,9 +201,15 @@ RPM: -12 | S1: 820 mV | S2: 815 mV | TPS: 4.32 % | Torque: 0.00 Nm | Relay: OFF 
 Plus one-shot event lines on state changes and on entering the CAN fault.
 
 **[`tools/can_brake_dashboard.py`](../../tools/can_brake_dashboard.py)** plots
-this live and logs it to CSV. It also reconstructs two things the sketch does not
-send — timer progress and CAN link health — and labels both as inferences. See
-[../../tools/README.md](../../tools/README.md).
+this live and logs it to CSV. Alongside the signals above it shows an **apply
+gate** — which of the two conditions is currently blocking the brake — and it
+distinguishes a dead serial link from a dead CAN bus, so a frozen plot is never
+mistaken for a quiet one.
+
+Three values the sketch does not send are reconstructed host-side and labelled
+as inferences: timer progress, CAN link health, and the `|S1 - S2|` pedal
+spread. **The firmware does not compare S1 and S2** — that readout is a
+host-side observation only. See [../../tools/README.md](../../tools/README.md).
 
 ---
 

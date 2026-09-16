@@ -1,33 +1,44 @@
 #!/usr/bin/env python3
 """
 can_brake_dashboard.py - live dashboard for the ESP32-S3 / TWAI-CAN
-electronic brake controller (EBrake_Control_ESP32S3_2ChRELAY_TJA1050.ino).
+electronic brake controller (firmware/EBrakeCAN/EBrakeCAN.ino).
 
-Same layout and conventions as brake_dashboard.py, but fed by the CAN
-build's telemetry instead of the Mega's analogue one:
-
-    BRAKE STATE   full-width banner + colour shading behind every trace
-                  + a dedicated APPLIED/RELEASED strip
-    TPS           throttle position [%] with the release/apply thresholds
-    RPM           shaft speed from CAN 0x015, with the +/- threshold band
-    PEDAL/TORQUE  raw accelerator sensors S1/S2 [mV] and torque request [Nm]
+Layout
+------
+  HEADER      brake state, TPS, RPM, the apply gate, and CAN link health
+  TPS         throttle position [%], with the hysteresis band shaded
+  RPM         shaft speed from CAN 0x015, with the apply deadband shaded
+  PEDAL       accelerator sensors S1/S2 [mV] and the torque request [Nm]
+  BRAKE       an APPLIED/RELEASED timeline, with the apply timer filling it
+  EVENTS      the firmware's own messages, as they arrive
 
 Expected serial line (printStatus() in the sketch):
 
     RPM: -12 | S1: 820 mV | S2: 815 mV | TPS: 4.32 % | Torque: 0.00 Nm |
     Relay: OFF | Brake: APPLIED | Timer: RESET
 
-Two things the firmware does NOT send, reconstructed here:
+Two link indicators, and they mean different things
+---------------------------------------------------
+  SERIAL   host <-> board. Goes STALE when status lines stop arriving, so a
+           frozen plot can never be mistaken for a quiet one.
+  CAN      board <-> bus. Mirrors the firmware's own 500 ms frame timeout.
 
-  * Timer progress. The sketch prints only RUNNING/RESET, so elapsed time
-    is measured on this end from the RUNNING edge and clamped to
-    --brake-ms. It is an estimate, drawn dashed, not a device reading.
+Three values the firmware does not send, reconstructed here
+-----------------------------------------------------------
+Each is marked in the UI as an estimate rather than a device reading:
+
+  * Timer progress. The sketch prints only RUNNING/RESET, so the elapsed
+    time is measured on this end from the RUNNING edge and clamped to
+    --brake-ms. Its resolution is the sketch's 100 ms print interval.
 
   * CAN health. The sketch announces "CAN signals unavailable" once on
-    entering the fault and says nothing on recovery. The CAN chip here
-    turns red on that message and clears again as soon as any decoded
-    value changes, which can only happen if fresh frames are arriving.
-    Inferred, not reported.
+    entering the fault and says nothing on recovery. The CAN card turns red
+    on that message and clears again as soon as any decoded value changes,
+    which can only happen if fresh frames are arriving.
+
+  * Pedal deviation. |S1 - S2| is shown because a dual-sensor pedal is
+    redundant by design and a split between the two means a failing sensor.
+    THE FIRMWARE DOES NOT CHECK THIS. It is a host-side observation only.
 
 Usage
 -----
@@ -55,6 +66,7 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Patch, Rectangle
 
 # ============================================================
 # DEFAULTS - keep in sync with the sketch
@@ -65,34 +77,56 @@ TPS_RELEASE   = 5.0       # TPS_RELEASE_THRESHOLD_PERCENT
 TPS_APPLY     = 4.5       # TPS_APPLY_THRESHOLD_PERCENT
 RPM_TH        = 20.0      # RPM_APPLY_THRESHOLD
 BRAKE_MS      = 1000      # BRAKE_APPLY_DELAY_MS
-CAN_TIMEOUT   = 500       # CAN_TIMEOUT_MS (shown, not enforced here)
+CAN_TIMEOUT   = 500       # CAN_TIMEOUT_MS - shown, and used for the CAN card
 WINDOW_S      = 30.0
 FPS           = 20.0
 MAX_POINTS    = 20000
 CSV_FLUSH_SEC = 1.0
 
+# The sketch prints every 100 ms. Fifteen missed prints is a dead link, not
+# a slow one - at that point the traces are frozen and must be labelled so.
+STALE_S       = 1.5
+
+# Host-side plausibility hint only. The firmware does not compare S1 and S2.
+PEDAL_DEV_WARN_MV = 200.0
+
 # autoscale behaviour
 TPS_MIN_SPAN  = 12.0      # %    - never zoom tighter than this
 RPM_MIN_SPAN  = 40.0      # rpm
 MV_MIN_SPAN   = 200.0     # mV
+NM_MIN_SPAN   = 4.0       # Nm
 PAD           = 0.18      # fraction of span added above and below
 SHRINK_RATIO  = 2.2       # only zoom back in when the axis is this much too big
 
-# palette
-BG      = "#0e1216"
-PANEL   = "#161b21"
-GRID    = "#28313a"
-FG      = "#e3eaf2"
-MUTED   = "#7d8a97"
+# ---- palette ----
+BG      = "#0d1117"
+PANEL   = "#161b22"
+GRID    = "#283039"
+EDGE    = "#30363d"
+FG      = "#e6edf3"
+MUTED   = "#8b949e"
+DIM     = "#6e7681"
 C_TPS   = "#4ea3ff"
-C_RPM   = "#39d98a"
-C_BRAKE = "#ff4d54"       # brake APPLIED
-C_FREE  = "#2ecc71"       # brake RELEASED
-C_TIMER = "#ffb020"
-C_S1    = "#9b8cff"
-C_S2    = "#5f6fd6"
+C_RPM   = "#3fb950"
+C_BRAKE = "#f85149"       # brake APPLIED
+C_FREE  = "#3fb950"       # brake RELEASED
+C_TIMER = "#d29922"
+C_S1    = "#a371f7"
+C_S2    = "#6a8bd6"
 C_TRQ   = "#ff8f4d"
-C_WARN  = "#ffd166"
+C_WARN  = "#d29922"
+C_IDLE  = "#30363d"       # state not yet known
+INK     = "#0d1117"       # text on a saturated banner
+
+# ---- type scale ----
+FS_TITLE = 11.5
+FS_BADGE = 8.5
+FS_CARD  = 8.0            # card heading
+FS_VAL   = 21             # card value
+FS_SUB   = 8.0            # card sub-line
+FS_AXIS  = 8.5
+FS_TICK  = 7.5
+FS_NOTE  = 7.5            # in-plot annotation
 
 NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 
@@ -111,6 +145,11 @@ RE_BRAKE  = rx(r"Brake:\s*(APPLIED|RELEASED)")
 RE_TIMER  = rx(r"Timer:\s*(RUNNING|RESET)")
 
 RE_CAN_LOST = rx(r"CAN signals unavailable")
+
+
+def clock(seconds):
+    s = int(max(0.0, seconds))
+    return f"{s // 3600:02d}:{(s // 60) % 60:02d}:{s % 60:02d}"
 
 
 # ============================================================
@@ -292,6 +331,7 @@ class DemoReader(threading.Thread):
                 tps = 1.5 + 34.0 * max(0.0, duty - 0.45)
                 rpm = 900 * max(0.0, duty - 0.45) + np.random.randn() * 5
 
+                was = self.brake
                 if self.brake > 0.5:
                     self.timer_on = False
                     if tps >= TPS_RELEASE:
@@ -300,10 +340,21 @@ class DemoReader(threading.Thread):
                     if tps < TPS_APPLY and abs(rpm) < RPM_TH:
                         if not self.timer_on:
                             self.timer_on, self.timer_t0 = True, t
+                            with self._lock:
+                                self._events.append(
+                                    (t, "TPS low and speed below 20 RPM: "
+                                        "one-second timer started"))
                         elif (t - self.timer_t0) * 1000.0 >= BRAKE_MS:
                             self.brake, self.timer_on = 1.0, False
                     else:
                         self.timer_on = False
+                if was != self.brake:
+                    with self._lock:
+                        self._events.append(
+                            (t, "TPS >= 0%: relay ON, BRAKE RELEASED"
+                                if self.brake < 0.5 else
+                                "Conditions true for 1 second: "
+                                "relay OFF, BRAKE APPLIED"))
             else:
                 # fault: values freeze, brake commanded on, timer cancelled
                 self.brake, self.timer_on = 1.0, False
@@ -349,14 +400,53 @@ def smart_ylim(ax, y, min_span, include=()):
         ax.set_ylim(lo, hi)
 
 
-def style_axis(ax, ylabel):
+# ============================================================
+# CHROME
+# ============================================================
+
+def style_axis(ax, ylabel, last_row=False):
     ax.set_facecolor(PANEL)
-    ax.grid(True, color=GRID, lw=0.6, alpha=0.85)
+    ax.grid(True, color=GRID, lw=0.6, alpha=0.8)
     ax.set_axisbelow(True)
-    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.tick_params(colors=MUTED, labelsize=FS_TICK)
     for s in ax.spines.values():
-        s.set_color(GRID)
-    ax.set_ylabel(ylabel, color=MUTED, fontsize=9)
+        s.set_color(EDGE)
+    ax.set_ylabel(ylabel, color=MUTED, fontsize=FS_AXIS)
+    if not last_row:
+        # one time axis for the whole stack, on the bottom panel
+        ax.tick_params(labelbottom=False)
+
+
+def blank_panel(ax):
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_facecolor(PANEL)
+    for s in ax.spines.values():
+        s.set_color(EDGE)
+    return ax
+
+
+def corner_note(ax, text):
+    """Threshold legend in the top-right corner of a plot.
+
+    Deliberately not drawn beside the threshold lines: the release and
+    apply levels are 0.5 % apart, so labels placed on them overlap each
+    other and sit on top of the trace.
+    """
+    return ax.text(0.995, 0.94, text, transform=ax.transAxes,
+                   ha="right", va="top", color=DIM, fontsize=FS_NOTE,
+                   bbox=dict(boxstyle="round,pad=0.32", fc=BG, ec=EDGE,
+                             lw=0.6, alpha=0.92))
+
+
+def make_card(ax, heading):
+    blank_panel(ax)
+    ax.text(0.07, 0.79, heading, color=MUTED, fontsize=FS_CARD,
+            transform=ax.transAxes)
+    val = ax.text(0.07, 0.44, "--", color=DIM, fontsize=FS_VAL,
+                  va="center", transform=ax.transAxes)
+    sub = ax.text(0.07, 0.15, "waiting for data", color=DIM, fontsize=FS_SUB,
+                  transform=ax.transAxes)
+    return val, sub
 
 
 # ============================================================
@@ -410,7 +500,8 @@ def main():
     T = deque(maxlen=n); TPS = deque(maxlen=n); RPM = deque(maxlen=n)
     S1 = deque(maxlen=n); S2 = deque(maxlen=n); TRQ = deque(maxlen=n)
     BRK = deque(maxlen=n); TMR = deque(maxlen=n)
-    events = deque(maxlen=60)
+    events = deque(maxlen=200)
+    rate_window = deque(maxlen=120)      # (wall_time, n_lines) for lines/s
 
     csv_f = open(args.csv, "w", newline="")
     csv_w = csv.writer(csv_f)
@@ -423,117 +514,139 @@ def main():
     plt.rcParams.update({"figure.facecolor": BG, "savefig.facecolor": BG,
                          "text.color": FG, "font.family": "monospace"})
     plt.ion()
-    fig = plt.figure(figsize=(14.5, 9.5))
+    fig = plt.figure(figsize=(15.0, 9.6))
     try:
         fig.canvas.manager.set_window_title(
-            "ESP32-S3 CAN - TPS / RPM / brake")
+            "ESP32-S3 CAN brake monitor")
     except Exception:
         pass
-    gs = GridSpec(5, 4, figure=fig,
-                  height_ratios=[1.05, 1.45, 1.45, 1.05, 0.5],
-                  hspace=0.42, wspace=0.22,
-                  left=0.06, right=0.94, top=0.94, bottom=0.07)
+    gs = GridSpec(6, 12, figure=fig,
+                  height_ratios=[1.00, 1.30, 1.30, 1.05, 0.40, 0.42],
+                  hspace=0.34, wspace=0.55,
+                  left=0.055, right=0.926, top=0.915, bottom=0.062)
 
-    # --- brake banner ---
-    ax_ban = fig.add_subplot(gs[0, 0])
-    ax_ban.set_xticks([]); ax_ban.set_yticks([])
+    # ---- title bar ----
+    fig.text(0.055, 0.962, "ESP32-S3  CAN BRAKE MONITOR", color=FG,
+             fontsize=FS_TITLE, fontweight="bold", va="center")
+    src_txt = fig.text(0.055, 0.936,
+                       "demo - synthetic data" if args.demo else "",
+                       color=DIM, fontsize=FS_BADGE, va="center")
+    link_txt = fig.text(0.935, 0.962, "WAITING", color=DIM,
+                        fontsize=FS_BADGE, ha="right", va="center",
+                        fontweight="bold")
+    stat_txt = fig.text(0.935, 0.936, "", color=DIM, fontsize=FS_BADGE,
+                        ha="right", va="center")
+
+    # ---- brake banner ----
+    ax_ban = blank_panel(fig.add_subplot(gs[0, 0:4]))
     for s in ax_ban.spines.values():
-        s.set_color(GRID); s.set_linewidth(2)
-    ax_ban.set_facecolor(C_BRAKE)
-    ban_txt = ax_ban.text(0.5, 0.58, "APPLIED", color="#0b0e11", fontsize=24,
-                          ha="center", va="center", fontweight="bold",
+        s.set_linewidth(1.6)
+    ax_ban.set_facecolor(C_IDLE)
+    ban_head = ax_ban.text(0.045, 0.80, "BRAKE", color=MUTED,
+                           fontsize=FS_CARD, transform=ax_ban.transAxes)
+    ban_txt = ax_ban.text(0.045, 0.45, "NO DATA", color=MUTED, fontsize=26,
+                          va="center", fontweight="bold",
                           transform=ax_ban.transAxes)
-    ban_sub = ax_ban.text(0.5, 0.16, "waiting for data", color="#0b0e11",
-                          fontsize=9, ha="center", va="center",
+    ban_sub = ax_ban.text(0.045, 0.14, "waiting for the first status line",
+                          color=MUTED, fontsize=FS_SUB,
                           transform=ax_ban.transAxes)
 
-    def card(ax, title):
-        ax.set_xticks([]); ax.set_yticks([])
-        ax.set_facecolor(PANEL)
-        for s in ax.spines.values():
-            s.set_color(GRID)
-        ax.text(0.06, 0.80, title, color=MUTED, fontsize=9,
-                transform=ax.transAxes)
-        val = ax.text(0.06, 0.42, "--", color=FG, fontsize=24,
-                      transform=ax.transAxes)
-        sub = ax.text(0.06, 0.15, "", color=MUTED, fontsize=8.5,
-                      transform=ax.transAxes)
-        return val, sub
+    tps_val, tps_sub = make_card(fig.add_subplot(gs[0, 4:6]),
+                                 "TPS   CAN 0x0B7")
+    rpm_val, rpm_sub = make_card(fig.add_subplot(gs[0, 6:8]),
+                                 "RPM   CAN 0x015")
 
-    tps_val, tps_sub = card(fig.add_subplot(gs[0, 1]), "TPS  (CAN 0x0B7)")
-    rpm_val, rpm_sub = card(fig.add_subplot(gs[0, 2]), "RPM  (CAN 0x015)")
+    # ---- apply gate: the "why is it not braking yet" card ----
+    ax_gate = blank_panel(fig.add_subplot(gs[0, 8:10]))
+    ax_gate.text(0.07, 0.79, "APPLY GATE   est.", color=MUTED,
+                 fontsize=FS_CARD, transform=ax_gate.transAxes)
+    gate_val = ax_gate.text(0.07, 0.50, "--", color=DIM, fontsize=FS_VAL,
+                            va="center", transform=ax_gate.transAxes)
+    bar_bg = Rectangle((0.07, 0.235), 0.86, 0.085, transform=ax_gate.transAxes,
+                       fc=GRID, ec="none", zorder=2)
+    bar_fg = Rectangle((0.07, 0.235), 0.0, 0.085, transform=ax_gate.transAxes,
+                       fc=C_TIMER, ec="none", zorder=3)
+    ax_gate.add_patch(bar_bg); ax_gate.add_patch(bar_fg)
+    gate_c1 = ax_gate.text(0.07, 0.10, "", color=DIM, fontsize=FS_SUB,
+                           transform=ax_gate.transAxes)
+    gate_c2 = ax_gate.text(0.53, 0.10, "", color=DIM, fontsize=FS_SUB,
+                           transform=ax_gate.transAxes)
 
-    # --- CAN link card ---
-    ax_can = fig.add_subplot(gs[0, 3])
-    ax_can.set_xticks([]); ax_can.set_yticks([])
-    ax_can.set_facecolor(PANEL)
-    for s in ax_can.spines.values():
-        s.set_color(GRID)
-    ax_can.text(0.06, 0.80, "CAN LINK", color=MUTED, fontsize=9,
-                transform=ax_can.transAxes)
-    can_val = ax_can.text(0.06, 0.42, "--", color=FG, fontsize=24,
-                          transform=ax_can.transAxes)
-    can_sub = ax_can.text(0.06, 0.15, f"timeout {CAN_TIMEOUT} ms", color=MUTED,
-                          fontsize=8.5, transform=ax_can.transAxes)
+    can_val, can_sub = make_card(fig.add_subplot(gs[0, 10:12]),
+                                 "CAN LINK   est.")
 
-    # --- TPS ---
+    # ---- TPS ----
     ax_tps = fig.add_subplot(gs[1, :])
-    style_axis(ax_tps, "TPS [%]")
-    ax_tps.axhline(REL_TH, ls="--", lw=1.1, color=MUTED)
-    ax_tps.axhline(APP_TH, ls=":", lw=1.1, color=MUTED)
-    ax_tps.text(0.004, REL_TH, f" release {REL_TH:.1f} %", color=MUTED,
-                fontsize=8, va="bottom",
-                transform=ax_tps.get_yaxis_transform())
-    ax_tps.text(0.004, APP_TH, f" apply {APP_TH:.1f} %", color=MUTED,
-                fontsize=8, va="top", transform=ax_tps.get_yaxis_transform())
-    l_tps, = ax_tps.plot([], [], lw=1.7, color=C_TPS)
+    style_axis(ax_tps, "TPS  [%]")
+    ax_tps.axhspan(APP_TH, REL_TH, color=C_WARN, alpha=0.20, lw=0, zorder=0)
+    ax_tps.axhline(REL_TH, ls="--", lw=1.0, color=C_WARN, alpha=0.85, zorder=1)
+    ax_tps.axhline(APP_TH, ls="--", lw=1.0, color=C_WARN, alpha=0.85, zorder=1)
+    corner_note(ax_tps, f"release >= {REL_TH:.1f} %   "
+                        f"apply < {APP_TH:.1f} %   (band = hysteresis)")
+    l_tps, = ax_tps.plot([], [], lw=1.7, color=C_TPS, zorder=4)
     ax_tps.set_ylim(0, max(REL_TH * 3, TPS_MIN_SPAN))
     ax_tps.set_xlim(0, args.window)
-    ax_tps.tick_params(labelbottom=False)   # only the strip carries the axis
 
-    # --- RPM ---
+    # ---- RPM ----
     ax_rpm = fig.add_subplot(gs[2, :], sharex=ax_tps)
-    style_axis(ax_rpm, "speed [rpm]")
-    ax_rpm.axhline(RP_TH, ls="--", lw=1.0, color=MUTED)
-    ax_rpm.axhline(-RP_TH, ls="--", lw=1.0, color=MUTED)
-    ax_rpm.text(0.004, RP_TH, f" +/-{RP_TH:.0f} rpm", color=MUTED, fontsize=8,
-                va="bottom", transform=ax_rpm.get_yaxis_transform())
-    l_rpm, = ax_rpm.plot([], [], lw=1.8, color=C_RPM)
+    style_axis(ax_rpm, "speed  [rpm]")
+    ax_rpm.axhspan(-RP_TH, RP_TH, color=C_RPM, alpha=0.13, lw=0, zorder=0)
+    ax_rpm.axhline(RP_TH, ls="--", lw=1.0, color=C_RPM, alpha=0.8, zorder=1)
+    ax_rpm.axhline(-RP_TH, ls="--", lw=1.0, color=C_RPM, alpha=0.8, zorder=1)
+    corner_note(ax_rpm, f"band = stopped:  |rpm| < {RP_TH:.0f}")
+    l_rpm, = ax_rpm.plot([], [], lw=1.7, color=C_RPM, zorder=4)
     ax_rpm.set_ylim(-RP_TH * 2, RP_TH * 2)
-    ax_rpm.tick_params(labelbottom=False)
 
-    # --- pedal sensors + torque request ---
+    # ---- pedal sensors + torque request ----
     ax_ped = fig.add_subplot(gs[3, :], sharex=ax_tps)
-    style_axis(ax_ped, "pedal [mV]")
-    ax_ped.tick_params(labelbottom=False)
+    style_axis(ax_ped, "pedal  [mV]")
     l_s1, = ax_ped.plot([], [], lw=1.3, color=C_S1, label="S1")
-    l_s2, = ax_ped.plot([], [], lw=1.3, color=C_S2, label="S2")
+    l_s2, = ax_ped.plot([], [], lw=1.3, color=C_S2, ls="--", label="S2")
     ax_trq = ax_ped.twinx()
     ax_trq.set_facecolor("none")
-    ax_trq.tick_params(colors=MUTED, labelsize=8)
+    ax_trq.tick_params(colors=MUTED, labelsize=FS_TICK)
     for s in ax_trq.spines.values():
-        s.set_color(GRID)
-    ax_trq.set_ylabel("torque req [Nm]", color=C_TRQ, fontsize=9)
-    l_trq, = ax_trq.plot([], [], lw=1.4, color=C_TRQ, label="torque")
-    leg = ax_ped.legend(handles=[l_s1, l_s2, l_trq], loc="upper left",
-                        fontsize=8, facecolor=PANEL, edgecolor=GRID,
-                        labelcolor=MUTED, framealpha=0.9)
-    leg.get_frame().set_linewidth(0.6)
+        s.set_color(EDGE)
+    ax_trq.set_ylabel("torque  [Nm]", color=C_TRQ, fontsize=FS_AXIS,
+                      labelpad=7)
+    l_trq, = ax_trq.plot([], [], lw=1.4, color=C_TRQ, label="torque req")
+    # legend above the panel: inside it, this sat on top of the traces
+    ax_ped.legend(handles=[l_s1, l_s2, l_trq], loc="lower left",
+                  bbox_to_anchor=(0.0, 1.01), ncol=3, frameon=False,
+                  fontsize=FS_NOTE, labelcolor=MUTED,
+                  handlelength=1.8, columnspacing=1.6)
+    dev_note = corner_note(ax_ped, "")
 
-    # --- brake strip ---
+    # ---- brake strip ----
     ax_st = fig.add_subplot(gs[4, :], sharex=ax_tps)
     ax_st.set_facecolor(PANEL)
-    ax_st.set_yticks([]); ax_st.set_ylim(0, 1)
-    ax_st.tick_params(colors=MUTED, labelsize=8)
-    for s in ax_st.spines.values():
-        s.set_color(GRID)
-    ax_st.set_ylabel("brake", color=MUTED, fontsize=9)
-    ax_st.set_xlabel("time [s]", color=MUTED, fontsize=9)
-    l_tmr, = ax_st.plot([], [], lw=1.4, ls="--", color=C_TIMER)
+    for s_ in ax_st.spines.values():
+        s_.set_color(EDGE)
+    ax_st.set_yticks([])                 # y is meaningless here; x is not
+    ax_st.set_ylim(0, 1)
+    ax_st.tick_params(colors=MUTED, labelsize=FS_TICK)
+    ax_st.set_ylabel("brake", color=MUTED, fontsize=FS_AXIS)
+    ax_st.set_xlabel("time since first status line  [s]", color=MUTED,
+                     fontsize=FS_AXIS)
+    # a colour key, because the state is otherwise carried by hue alone
+    ax_st.legend(handles=[
+        Patch(fc=C_BRAKE, alpha=0.55, ec="none", label="APPLIED"),
+        Patch(fc=C_FREE, alpha=0.45, ec="none", label="RELEASED"),
+        Patch(fc=C_TIMER, alpha=0.9, ec="none", label="apply timer")],
+        loc="lower left", bbox_to_anchor=(0.0, 1.04), ncol=3, frameon=False,
+        fontsize=FS_NOTE, labelcolor=MUTED, handlelength=1.4,
+        handleheight=0.9, columnspacing=1.6)
+
+    # ---- event log ----
+    ax_ev = blank_panel(fig.add_subplot(gs[5, :]))
+    ax_ev.text(0.006, 0.80, "FIRMWARE EVENTS", color=MUTED, fontsize=FS_CARD,
+               transform=ax_ev.transAxes)
+    ev_lines = [ax_ev.text(0.006, y, "", color=DIM, fontsize=FS_SUB,
+                           transform=ax_ev.transAxes)
+                for y in (0.50, 0.26, 0.04)]
 
     shading = {"tps": None, "rpm": None, "ped": None,
-               "st_on": None, "st_off": None}
-    title = fig.suptitle("waiting for data ...", color=FG, fontsize=13)
+               "st_on": None, "st_off": None, "timer": None}
 
     plt.show(block=False)
     fig.canvas.draw()
@@ -550,17 +663,31 @@ def main():
     can_fault = False
     can_fault_t = None
     prev_vals = None
+    last_rx = None           # wall clock of the most recent status line
 
     try:
         while plt.fignum_exists(fig.number) and reader.running:
             recs, evs = reader.drain()
 
-            for e in evs:
-                events.append(e)
-                if RE_CAN_LOST.search(e[1]):
-                    can_fault, can_fault_t = True, e[0]
+            # Events and status lines must be replayed in the order the board
+            # produced them. Handling all events first would let a value
+            # change from BEFORE a CAN fault clear that fault immediately,
+            # because one drain can span the moment the link dropped.
+            stream = ([(e[0], 0, e) for e in evs] +
+                      [(r["t"], 1, r) for r in recs])
+            stream.sort(key=lambda item: item[0])
 
-            for r in recs:
+            for _, kind, item in stream:
+                if kind == 0:
+                    events.append(item)
+                    if RE_CAN_LOST.search(item[1]):
+                        can_fault, can_fault_t = True, item[0]
+                        # never compare across the boundary: the last good
+                        # value and the first frozen one legitimately differ
+                        prev_vals = None
+                    continue
+
+                r = item
                 # timer progress: the sketch sends RUNNING/RESET only
                 if r["timer"] > 0.5:
                     if timer_t0 is None:
@@ -588,6 +715,8 @@ def main():
                                 int(r["timer"]), f"{timer_ms:.0f}"])
             if recs:
                 last = recs[-1]
+                last_rx = time.time()
+                rate_window.append((last_rx, len(recs)))
 
             if time.time() - last_flush > CSV_FLUSH_SEC:
                 csv_f.flush(); last_flush = time.time()
@@ -598,9 +727,35 @@ def main():
                 continue
             next_draw = now + frame_dt
 
+            # ---- link badge: host <-> board, independent of CAN ----
+            stale = last_rx is None or (now - last_rx) > STALE_S
+            if last_rx is None:
+                link_txt.set_text("WAITING"); link_txt.set_color(C_WARN)
+                stat_txt.set_text(f"{reader.n_bytes} bytes in")
+            elif stale:
+                link_txt.set_text("SERIAL STALE"); link_txt.set_color(C_BRAKE)
+                stat_txt.set_text(f"no line for {now - last_rx:4.1f} s"
+                                  f"   {reader.n_ok} total")
+            else:
+                while rate_window and now - rate_window[0][0] > 3.0:
+                    rate_window.popleft()
+                rate = (sum(c for _, c in rate_window) /
+                        max(1e-3, now - rate_window[0][0])) if rate_window else 0.0
+                link_txt.set_text("LIVE"); link_txt.set_color(C_FREE)
+                stat_txt.set_text(f"{rate:4.1f} lines/s   {reader.n_ok} total"
+                                  f"   {clock(T[-1] if T else 0)}")
+
+            # ---- event log ----
+            recent = list(events)[-3:]
+            for slot, txt in zip(ev_lines, recent + [None] * (3 - len(recent))):
+                if txt is None:
+                    slot.set_text("")
+                    continue
+                et, msg = txt
+                slot.set_text(f"{et:7.1f} s   {msg[:150]}")
+                slot.set_color(C_BRAKE if RE_CAN_LOST.search(msg) else MUTED)
+
             if len(T) < 2 or last is None:
-                title.set_text(f"waiting for data ...  "
-                               f"{reader.n_bytes} bytes received")
                 plt.pause(0.01)
                 continue
 
@@ -618,7 +773,6 @@ def main():
             l_s1.set_data(t, s1)
             l_s2.set_data(t, s2)
             l_trq.set_data(t, trq)
-            l_tmr.set_data(t, tmr)
 
             x0 = max(t[0], t[-1] - args.window)
             ax_tps.set_xlim(x0, max(t[-1], x0 + 1e-3))
@@ -629,63 +783,128 @@ def main():
             smart_ylim(ax_rpm, rpm[vis], RPM_MIN_SPAN,
                        include=(-RP_TH, RP_TH))
             smart_ylim(ax_ped, np.concatenate((s1[vis], s2[vis])), MV_MIN_SPAN)
-            smart_ylim(ax_trq, trq[vis], 2.0, include=(0.0,))
+            smart_ylim(ax_trq, trq[vis], NM_MIN_SPAN, include=(0.0,))
 
-            for key, ax in (("tps", ax_tps), ("rpm", ax_rpm),
-                            ("ped", ax_ped)):
+            # brake shading behind every trace
+            for key, ax in (("tps", ax_tps), ("rpm", ax_rpm), ("ped", ax_ped)):
                 if shading[key] is not None:
                     shading[key].remove()
                 shading[key] = ax.fill_between(
                     t, 0, 1, where=brk > 0.5, step="post",
                     transform=ax.get_xaxis_transform(),
-                    color=C_BRAKE, alpha=0.13, lw=0)
-            for key, cond, col in (("st_on", brk > 0.5, C_BRAKE),
-                                   ("st_off", brk <= 0.5, C_FREE)):
+                    color=C_BRAKE, alpha=0.085, lw=0, zorder=0)
+
+            # strip: state as colour, timer as a filling wedge on top
+            for key, cond, col, alpha in (
+                    ("st_on", brk > 0.5, C_BRAKE, 0.55),
+                    ("st_off", brk <= 0.5, C_FREE, 0.45)):
                 if shading[key] is not None:
                     shading[key].remove()
                 shading[key] = ax_st.fill_between(
                     t, 0, 1, where=cond, step="post",
-                    color=col, alpha=0.55, lw=0)
+                    color=col, alpha=alpha, lw=0, zorder=1)
+            if shading["timer"] is not None:
+                shading["timer"].remove()
+            shading["timer"] = ax_st.fill_between(
+                t, 0, tmr, step="post", color=C_TIMER, alpha=0.9, lw=0,
+                zorder=2)
 
             braking = last["brake"] > 0.5
-            ax_ban.set_facecolor(C_BRAKE if braking else C_FREE)
-            ban_txt.set_text("APPLIED" if braking else "RELEASED")
-            ban_sub.set_text(("relay OFF - shaft held" if braking
-                              else "relay ON - shaft free")
-                             + f"    {brake_edges} changes")
+            state_col = C_BRAKE if braking else C_FREE
 
-            released = last["tps"] >= REL_TH
-            low_tps = last["tps"] < APP_TH
-            tps_val.set_text(f"{last['tps']:6.2f} %")
-            tps_val.set_color(C_WARN if released else C_TPS)
-            if released:
-                tps_sub.set_text(f"ABOVE release {REL_TH:.1f} %")
-            elif low_tps:
-                tps_sub.set_text(f"below apply {APP_TH:.1f} %")
+            # ---- banner ----
+            if stale:
+                ax_ban.set_facecolor(C_IDLE)
+                ban_txt.set_text("STALE"); ban_txt.set_color(C_BRAKE)
+                ban_sub.set_text(f"last state was "
+                                 f"{'APPLIED' if braking else 'RELEASED'}"
+                                 f" - serial has stopped")
+                ban_sub.set_color(MUTED); ban_head.set_color(MUTED)
             else:
-                tps_sub.set_text(f"in hysteresis band "
-                                 f"{APP_TH:.1f}-{REL_TH:.1f} %")
+                ax_ban.set_facecolor(state_col)
+                ban_txt.set_text("APPLIED" if braking else "RELEASED")
+                ban_txt.set_color(INK)
+                ban_sub.set_text(("relay OFF - shaft held" if braking
+                                  else "relay ON - shaft free")
+                                 + f"      {brake_edges} state changes")
+                ban_sub.set_color(INK); ban_head.set_color(INK)
 
+            # ---- TPS card ----
+            above_rel = last["tps"] >= REL_TH
+            below_app = last["tps"] < APP_TH
+            tps_val.set_text(f"{last['tps']:.2f} %")
+            tps_val.set_color(C_WARN if above_rel else C_TPS)
+            tps_sub.set_text(
+                f"at/above release {REL_TH:.1f} %" if above_rel else
+                (f"below apply {APP_TH:.1f} %" if below_app else
+                 f"in band {APP_TH:.1f} - {REL_TH:.1f} %"))
+            tps_sub.set_color(MUTED)
+
+            # ---- RPM card ----
             slow = abs(last["rpm"]) < RP_TH
-            rpm_val.set_text(f"{last['rpm']:7.0f}")
+            rpm_val.set_text(f"{last['rpm']:.0f}")
             rpm_val.set_color(C_RPM if slow else C_WARN)
-            rpm_sub.set_text(f"|rpm| {'<' if slow else '>='} {RP_TH:.0f}"
-                             + (f"    timer {int(timer_ms)}/{BR_MS} ms"
-                                if last["timer"] > 0.5 else ""))
+            rpm_sub.set_text(f"stopped   |rpm| < {RP_TH:.0f}" if slow
+                             else f"turning   |rpm| >= {RP_TH:.0f}")
+            rpm_sub.set_color(MUTED)
 
-            can_val.set_text("FAULT" if can_fault else "OK")
-            can_val.set_color(C_BRAKE if can_fault else C_FREE)
-            can_sub.set_text(f"lost at t={can_fault_t:.1f} s"
-                             if can_fault and can_fault_t is not None
-                             else f"timeout {CAN_TIMEOUT} ms")
+            # ---- apply gate ----
+            if braking:
+                gate_val.set_text("HELD"); gate_val.set_color(MUTED)
+                bar_fg.set_width(0.0)
+                gate_c1.set_text(f"releases at TPS >= {REL_TH:.1f} %")
+                gate_c1.set_color(DIM)
+                gate_c2.set_text("")
+            else:
+                running = last["timer"] > 0.5
+                if running:
+                    gate_val.set_text(f"{timer_ms / 1000.0:.1f}/"
+                                      f"{BR_MS / 1000.0:.1f} s")
+                    gate_val.set_color(C_TIMER)
+                    bar_fg.set_width(0.86 * (timer_ms / BR_MS))
+                else:
+                    gate_val.set_text("open"); gate_val.set_color(MUTED)
+                    bar_fg.set_width(0.0)
+                gate_c1.set_text("TPS ok" if below_app else "TPS high")
+                gate_c1.set_color(C_FREE if below_app else C_WARN)
+                gate_c2.set_text("RPM ok" if slow else "RPM high")
+                gate_c2.set_color(C_FREE if slow else C_WARN)
 
-            title.set_text(
-                f"{'BRAKE APPLIED' if braking else 'BRAKE RELEASED'}     "
-                f"TPS {last['tps']:.2f} %     "
-                f"{last['rpm']:.0f} rpm     "
-                f"torque {last['torque']:.2f} Nm     "
-                f"{t[-1]:.0f} s     {reader.n_ok} lines")
-            title.set_color(C_BRAKE if braking else C_FREE)
+            # ---- CAN card ----
+            if can_fault:
+                can_val.set_text("FAULT"); can_val.set_color(C_BRAKE)
+                can_sub.set_text(f"lost at t = {can_fault_t:.1f} s"
+                                 if can_fault_t is not None else "no frames")
+            else:
+                can_val.set_text("OK"); can_val.set_color(C_FREE)
+                can_sub.set_text(f"firmware timeout {CAN_TIMEOUT} ms")
+            can_sub.set_color(MUTED)
+
+            # ---- nothing above is current if the feed has stopped ----
+            if stale:
+                for v in (tps_val, rpm_val, gate_val):
+                    v.set_color(DIM)
+                tps_sub.set_text("last value (stale)")
+                rpm_sub.set_text("last value (stale)")
+                tps_sub.set_color(DIM); rpm_sub.set_color(DIM)
+                gate_val.set_text("--")
+                bar_fg.set_width(0.0)
+                gate_c1.set_text(""); gate_c2.set_text("")
+                can_val.set_text("?"); can_val.set_color(DIM)
+                can_sub.set_text("unknown (stale)")
+                can_sub.set_color(DIM)
+
+            # ---- pedal deviation (host-side only) ----
+            if np.isfinite(last["s1"]) and np.isfinite(last["s2"]):
+                dev = abs(last["s1"] - last["s2"])
+                wide = dev > PEDAL_DEV_WARN_MV
+                dev_note.set_text(f"S1-S2 spread {dev:.0f} mV"
+                                  + ("   WIDE" if wide else "")
+                                  + "   (not checked by firmware)")
+                dev_note.set_color(DIM if stale else (C_WARN if wide else DIM))
+            else:
+                dev_note.set_text("S1/S2 not present in the status line")
+                dev_note.set_color(DIM)
 
             fig.canvas.draw_idle()
             plt.pause(0.001)                     # services the redraw
