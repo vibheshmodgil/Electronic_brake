@@ -41,7 +41,12 @@
 #define WEB_AP_SSID        "EBrake-Monitor"
 #define WEB_AP_PASSWORD    "brake1234"   // WPA2 needs 8 characters. CHANGE IT.
 #define WEB_AP_CHANNEL     1
-#define WEB_AP_MAX_CLIENTS 4
+#define WEB_AP_MAX_CLIENTS 5             // 4 viewers + the camera board
+
+// The camera board (firmware/EBrakeCam) joins this AP at this fixed
+// address; the dashboard's CAMERA card pulls frames from it. Must match
+// CAM_IP in EBrakeCam.ino. Set to "" to hide the card.
+#define CAM_HOST           "192.168.4.50"
 
 // Core 0 runs the WiFi stack already. The Arduino loop - and therefore
 // the brake algorithm - is on core 1 and stays there.
@@ -215,6 +220,90 @@ void snapshotGet(BrakeSnapshot *out)
   portENTER_CRITICAL(&snapshotMux);
   *out = snapshotShared;
   portEXIT_CRITICAL(&snapshotMux);
+}
+
+
+// ============================================================
+// CAN frame table
+// ============================================================
+//
+// Written only by the brake loop on core 1, read by the server on core 0.
+// The loop is the sole writer, so it can search without the lock; only
+// the slot update, and the reader's copy of each slot, are locked.
+//
+static CanFrameSlot canFrames[CAN_FRAME_SLOTS];
+static uint8_t canFrameCount = 0;
+static uint32_t canFramesOverflow = 0;
+
+static portMUX_TYPE canFrameMux = portMUX_INITIALIZER_UNLOCKED;
+
+
+void recordFrame(const twai_message_t &message)
+{
+  uint32_t id = message.identifier | (message.extd ? 0x80000000UL : 0);
+  uint8_t i = 0;
+
+  while (i < canFrameCount && canFrames[i].id != id)
+  {
+    i++;
+  }
+
+  if (i == CAN_FRAME_SLOTS)
+  {
+    canFramesOverflow++;
+    return;
+  }
+
+  uint8_t dlc = message.data_length_code > 8 ? 8 : message.data_length_code;
+
+  portENTER_CRITICAL(&canFrameMux);
+
+  CanFrameSlot &slot = canFrames[i];
+  slot.id = id;
+  slot.count++;
+  slot.lastMs = millis();
+  slot.dlc = dlc;
+  memcpy(slot.data, message.data, dlc);
+
+  if (i == canFrameCount)
+  {
+    canFrameCount++;
+  }
+
+  portEXIT_CRITICAL(&canFrameMux);
+}
+
+
+// Copies one slot per critical section, so the brake loop never waits on
+// more than a 24-byte copy. Returns how many were copied.
+uint8_t canFramesSnapshot(CanFrameSlot *out, uint32_t *overflow)
+{
+  uint8_t n = 0;
+
+  for (uint8_t i = 0; i < CAN_FRAME_SLOTS; i++)
+  {
+    portENTER_CRITICAL(&canFrameMux);
+
+    bool used = i < canFrameCount;
+
+    if (used)
+    {
+      out[i] = canFrames[i];
+    }
+
+    *overflow = canFramesOverflow;
+
+    portEXIT_CRITICAL(&canFrameMux);
+
+    if (!used)
+    {
+      break;
+    }
+
+    n++;
+  }
+
+  return n;
 }
 
 
@@ -662,6 +751,11 @@ void loop()
 
   if (result == ESP_OK)
   {
+    if (!message.rtr)
+    {
+      recordFrame(message);
+    }
+
     // Only process standard data frames.
     if (!message.extd && !message.rtr)
     {

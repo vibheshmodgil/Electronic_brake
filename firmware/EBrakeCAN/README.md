@@ -6,17 +6,22 @@ every input arrives as a CAN frame instead of an analogue voltage.
 ```
 firmware/EBrakeCAN/
 ├── EBrakeCAN.ino      the controller - CAN decoding and the state machine
-├── Telemetry.h        the snapshot struct shared by both sides
+├── Telemetry.h        types shared by both sides: snapshot, CAN frame table
+├── CanDbc.h           the CAN database the web UI decodes with (local only, gitignored)
+├── CanDbc.example.h   minimal public version - copy to CanDbc.h after cloning
 ├── WebUI.h            WiFi access point + read-only telemetry server
 └── WebPage.h          the dashboard page, served from flash
+
+../EBrakeCam/EBrakeCam.ino   optional camera board the dashboard shows
 ```
 
 > **Why `Telemetry.h` exists.** The Arduino IDE hoists a generated prototype
 > for every `.ino` function to the top of the file, above your own code. Any
 > type or macro named in a function *signature* must therefore be declared in
 > a header included near the top, or the build fails with
-> `'BrakeSnapshot' was not declared in this scope`. `snapshotGet()` and
-> `eventsSnapshot()` both name one, so those declarations live here. If you
+> `'BrakeSnapshot' was not declared in this scope`. `snapshotGet()`,
+> `canFramesSnapshot()` and `eventsSnapshot()` all name one, so those
+> declarations live here. If you
 > add a function that takes or returns a `BrakeSnapshot`, declare it here too.
 
 Uses only `Arduino.h`, the ESP-IDF `driver/twai.h`, and the `WiFi` /
@@ -76,7 +81,8 @@ meter and the brake disconnected before trusting it.
 ### Arduino IDE
 
 1. Install the **esp32** board package by Espressif (Boards Manager).
-2. Open `EBrakeCAN.ino`.
+2. First build after cloning: copy `CanDbc.example.h` to `CanDbc.h`
+   ([why](#candbch-is-not-in-the-repository)). Then open `EBrakeCAN.ino`.
 3. **Tools → Board → ESP32 Arduino → ESP32S3 Dev Module**
 4. Select the port, then Upload.
 5. **Tools → Serial Monitor**, set to **115200 baud**.
@@ -94,7 +100,9 @@ meter and the brake disconnected before trusting it.
 ## What it reads off the bus
 
 Two message IDs, both standard (11-bit) frames with a DLC of exactly 8. Anything
-else — extended frames, remote frames, wrong length, any other ID — is ignored.
+else — extended frames, remote frames, wrong length, any other ID — is ignored
+by the brake logic. (Every non-remote frame is still recorded, undecoded, for
+the web UI's CAN SIGNALS view.)
 
 All signals are **signed 16-bit, big-endian (Motorola)**, decoded by
 `readSigned16BigEndian()`.
@@ -105,6 +113,9 @@ All signals are **signed 16-bit, big-endian (Motorola)**, decoded by
 |---|---|---|
 | 3–4 | `N_RPM_SIG` — shaft speed | 1, signed |
 
+Position confirmed in the 2026-09-07 logs (smooth, up to 6376). The factor of
+1 rpm has not been checked against a tachometer.
+
 Negative means the other direction. The algorithm uses `abs()`, so direction
 does not affect braking.
 
@@ -112,10 +123,10 @@ does not affect braking.
 
 | Bytes | Signal | Scaling |
 |---|---|---|
-| 0–1 | Accelerator sensor 1 | mV |
-| 2–3 | Accelerator sensor 2 | mV |
+| 0–1 | Accelerator sensor 1 | 1 — likely mV, unit not verified |
+| 2–3 | Accelerator sensor 2 | 1 — likely mV, unit not verified |
 | 4–5 | Throttle position | ×0.01 → percent |
-| 6–7 | Torque request | ×0.01 → Nm |
+| 6–7 | Torque request | ×0.01 → Nm (scale not verified) |
 
 **Only TPS and RPM drive the logic.** S1, S2 and torque are decoded and printed
 for diagnostics — they are not part of the braking decision.
@@ -193,7 +204,8 @@ All at the top of the file.
 | `ENABLE_WEB_UI` | `1` | Set `0` to compile the WiFi dashboard out entirely |
 | `WEB_AP_SSID` / `WEB_AP_PASSWORD` | `EBrake-Monitor` / `brake1234` | Always — do not ship the default password |
 | `WEB_AP_CHANNEL` | `1` | The channel is congested where you are testing |
-| `WEB_AP_MAX_CLIENTS` | `4` | More or fewer devices need to watch at once |
+| `WEB_AP_MAX_CLIENTS` | `5` | More or fewer devices need to watch at once (the camera board uses one) |
+| `CAM_HOST` | `"192.168.4.50"` | You changed `CAM_IP` in `EBrakeCam.ino`, or `""` for no camera |
 | `WEB_TASK_CORE` | `0` | Never, unless you have moved the Arduino loop |
 
 The bit rate is not a constant — it is the
@@ -278,9 +290,71 @@ History is kept by the browser, not the board: the ESP32 only ever sends the
 present moment. Firmware RAM stays flat however long a session runs, and the
 only cost is that a device joining late starts with an empty chart.
 
+### Every other CAN signal, on a toggle
+
+Below the events is a **CAN SIGNALS** list: every message in the DBC plus
+anything else seen on the bus. Open a message, tick a signal, and it gets its
+own live chart below the EVENTS list, with brake-applied shading. A message
+that stops arriving for over a second shows `--` and its chart stops, rather
+than holding a stale value. Untick it, or press **hide**, to remove it. The
+ticks are remembered by that phone or laptop.
+
+The board keeps the latest raw bytes, count and age of each ID (up to 64)
+and serves them at `/api/can`. The page decodes them in the browser, with one
+of two DBCs:
+
+| Button | DBC used |
+|---|---|
+| *(default)* | The one built into the firmware from `CanDbc.h`, served at `/can.dbc`. **SAVE .DBC** downloads it for CANdb++ |
+| **LOAD .DBC** | A `.dbc` file picked on the phone or laptop — for example the full DBC from the office |
+
+A loaded file stays in that browser. It is never sent to the board, and
+nothing is reflashed. It is remembered across reloads (unless it is too big
+for browser storage, which the page says), and **BUILT-IN** goes back to the
+board's DBC.
+
+Any ID the DBC does not list still gets toggles, as raw bytes and big-endian
+16-bit words, unsigned and signed.
+
+### `CanDbc.h` is not in the repository
+
+This repository is public, and the real bus layout is not. So:
+
+- `CanDbc.h` is **gitignored**, and so is every `*.dbc`.
+- [`CanDbc.example.h`](CanDbc.example.h) is committed. It holds only the two
+  messages the brake logic reads, `0x015` and `0x0B7`.
+- **After cloning, copy `CanDbc.example.h` to `CanDbc.h`** or the sketch will
+  not build. Put your own DBC text in it if you want a richer built-in view,
+  or leave it minimal and use **LOAD .DBC**.
+
+In the built-in DBC, a signal whose `CM_ SG_` comment does not start with
+`CONFIRMED` gets an amber **predicted** label. Do not act on a predicted
+value. A DBC loaded with **LOAD .DBC** is shown as-is, without those labels.
+
+### The camera
+
+The page has a **CAMERA** card when a second board, an ESP32-S3 CAM running
+[`../EBrakeCam/EBrakeCam.ino`](../EBrakeCam/EBrakeCam.ino), is on the
+network. It joins `EBrake-Monitor` as a client at the fixed address
+`CAM_HOST` (`192.168.4.50`), and the page pulls one JPEG at a time from its
+`/capture`. **full** opens its MJPEG stream on port 81 (one viewer at a time).
+**pause** stops pulling frames on that device and is remembered.
+
+| | |
+|---|---|
+| Why a second board | Camera pins on S3 CAM boards include GPIO 5, 6 and 7 — this board's CAN and relay pins. It also keeps the camera's memory, WiFi load and crashes out of the brake controller |
+| Board settings | ESP32S3 Dev Module, PSRAM **OPI PSRAM**, Partition **Huge APP**, USB CDC On Boot **Enabled** |
+| Must match | `WIFI_SSID`, `WIFI_PASSWORD`, `CAM_IP` in `EBrakeCam.ino` ↔ `WEB_AP_SSID`, `WEB_AP_PASSWORD`, `CAM_HOST` here |
+| No camera | The card says `connecting` / `NO PICTURE - last frame N s ago`. Set `CAM_HOST ""` to remove it |
+
+`WEB_AP_MAX_CLIENTS` is 5 so the camera does not take a viewer's slot.
+Frames go through this board's radio. The server task and WiFi are on core 0,
+and the brake loop is on core 1, so a busy stream slows the page, not the
+brake. The picture is not part of any braking decision.
+
 ### It cannot move the brake
 
-There are three routes — the page, `/api/status` and `/api/events`. All three
+There are five routes — the page, `/api/status`, `/api/events`, `/api/can` and `/can.dbc`. All five
 are GET, and none of them touch the relay, the state machine or any constant.
 There is deliberately no endpoint that can release the brake, and adding one
 would put a WiFi client in the safety path.
@@ -291,8 +365,9 @@ The server runs in its own FreeRTOS task pinned to **core 0**, beside the
 WiFi stack Arduino already puts there. The brake algorithm is the Arduino
 loop, which keeps **core 1** to itself. A stalled request, a phone that drops
 mid-transfer, four phones polling at once — none of it can delay
-`twai_receive()` or the apply timer. The two sides meet only at a spinlocked
-copy of a ~40-byte struct.
+`twai_receive()` or the apply timer. The two sides meet only under spinlocks:
+a 48-byte snapshot copy, the event ring, and one 24-byte CAN frame slot at a
+time.
 
 If the access point fails to start, `webUiBegin()` says so on the serial port
 and returns; the controller then behaves exactly as if the web UI had been
@@ -341,19 +416,21 @@ unchanged, so `tools/can_brake_dashboard.py` still detects the fault.
 
 ## Verification status
 
-**Not compiled or hardware-tested in this repository** — no ESP32 toolchain was
-available where it was packaged. What *has* been checked here:
+**Compiled, not hardware-tested.** What has been checked (2026-09-16):
 
 | Checked | How |
 |---|---|
-| Brace, paren and bracket balance across all three files | Static parse |
-| `/api/status` format string vs its 19 arguments | Static parse |
+| The sketch builds for ESP32-S3 | `arduino-cli compile --fqbn esp32:esp32:esp32s3 --warnings all`, esp32 core 3.3.10: exit 0, no warnings from this sketch's files |
+| The local DBC in `CanDbc.h` is valid | Loads in `cantools` strict mode: no overlaps, none past its DLC, every signal commented |
+| LOAD .DBC | Headless Edge with a mock board: Motorola and Intel signals, scale and offset, an extended ID, a non-DBC file rejected, the built-in DBC arriving later does not replace the loaded one |
+| The page decodes the DBC correctly | The page's own script in headless Edge against an independent Python decoder: 4,916 cases on this DBC plus 354 parser edge cases (Intel, offsets, 32-bit, CRLF), 0 mismatches |
+| The firmware's 0x15/0xB7 decode matches the DBC | `readSigned16BigEndian()` offsets and scales vs the `SG_` lines, 25,000 random frames, 0 mismatches |
+| DBC comments match the logs | Every CONFIRMED/PREDICTED statement recomputed from the 2026-09-07 `motor_log_*` / `throttle_log_*` captures |
+| CAN SIGNALS view behaviour | Headless Edge with a mock board: list, toggles, plots, hide, stale frames, extended IDs |
 | Every JSON key the page reads is one the firmware sends | Cross-check of both sides |
-| Every DOM id the script touches exists in the page | Cross-check |
 | The server has no write route and never names the relay | Static parse |
-| The page fetches nothing external | Static parse |
-| The page renders and reflows at 320/390/768/1280/1600 px | Headless Chrome against a mock board serving this exact `WebPage.h` |
-| No function signature trips the Arduino prototype hoist | Static parse of every file-scope function against the types the sketch body declares |
+| The page fetches nothing external | Static parse — apart from the CAMERA card's JPEGs, from `CAM_HOST` on the same AP |
+| CAMERA card | Headless Edge with a mock board and mock camera, at 390, 900 and 1300 px |
 
-**None of that is a compile.** Build it before flashing, and commission with
-the brake mechanically disconnected.
+**None of that is a hardware test.** Commission with the brake mechanically
+disconnected.

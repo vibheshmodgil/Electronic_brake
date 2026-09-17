@@ -3,7 +3,9 @@
 // ============================================================
 //
 // One self-contained page. No CDN, no external stylesheet, no chart
-// library, no web font.
+// library, no web font. The one thing it loads from elsewhere is the
+// CAMERA card's JPEGs, from the camera board on this same access point
+// (firmware/EBrakeCam) - never from the internet.
 //
 // That is not a preference. A phone joined to this board's access point
 // has NO route to the internet, so anything fetched from a CDN simply
@@ -65,13 +67,13 @@ white-space:nowrap}
 .grid>*{min-width:0}
 .card{background:var(--panel);border:1px solid var(--edge);border-radius:8px;
 padding:10px 12px}
-.b-banner,.b-gate,.b-can,.b-chart,.b-events{grid-column:span 2}
+.b-banner,.b-gate,.b-can,.b-chart,.b-events,.b-cam{grid-column:span 2}
 .b-tps,.b-rpm{grid-column:span 1}
 @media(min-width:700px){
   .grid{grid-template-columns:repeat(4,1fr);gap:10px}
   .b-banner{grid-column:span 2}
   .b-gate,.b-can,.b-chart{grid-column:span 2}
-  .b-events{grid-column:span 4}
+  .b-events,.b-cam{grid-column:span 4}
 }
 @media(min-width:1100px){
   .grid{grid-template-columns:repeat(6,1fr)}
@@ -79,6 +81,8 @@ padding:10px 12px}
   .b-tps,.b-rpm,.b-gate,.b-can{grid-column:span 1}
   .b-chart{grid-column:span 3}
   .b-events{grid-column:span 6}
+  /* camera beside the two charts, all three on one row */
+  .b-cam,.b-cam:not([hidden])~.b-chart{grid-column:span 2}
 }
 
 .k{font-size:10px;color:var(--muted);letter-spacing:.05em}
@@ -102,8 +106,28 @@ canvas{width:100%;height:120px;display:block;margin-top:4px}
 
 #events div{font-size:10px;color:var(--muted);margin-top:4px;
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row{display:flex;justify-content:space-between;align-items:center;
+gap:8px;flex-wrap:wrap}
+.btn{text-decoration:none;font:inherit;font-size:10px;color:var(--fg);background:none;cursor:pointer;
+border:1px solid var(--edge);border-radius:5px;padding:4px 9px}
+#msgs details{border-top:1px solid var(--edge);padding:7px 0}
+#msgs details:first-child{margin-top:8px}
+#msgs summary{font-size:11px;cursor:pointer}
+#msgs summary .id{color:var(--tps)}
+.meta{font-size:10px;color:var(--dim);margin:2px 0 0 14px;
+overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sig{display:flex;align-items:center;gap:9px;font-size:11px;
+padding:6px 0 6px 14px;cursor:pointer}
+.sig span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pred{font-style:normal;font-size:9px;color:var(--amber)}
+.sig b{font-weight:400;color:var(--muted);white-space:nowrap}
+.sig input{width:18px;height:18px;margin:0;accent-color:var(--green)}
 .stale{opacity:.45}
 .note{font-size:9px;color:var(--dim);margin:8px 2px 0}
+#camImg{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;
+background:#000;border-radius:4px;margin-top:6px;transition:opacity .2s}
+@media(min-width:700px){#camImg{max-height:55vh}}
+@media(min-width:1100px){#camImg{aspect-ratio:auto;height:190px}}
 </style></head><body>
 <div class="wrap">
 
@@ -132,6 +156,13 @@ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     <div class="v" id="can" style="font-size:19px">--</div>
     <div class="s" id="canS">&nbsp;</div></div>
 
+  <div class="card b-cam" id="camCard" hidden>
+    <div class="row"><span class="k">CAMERA</span>
+      <span class="s" id="camS" style="margin:0;flex:1">&nbsp;</span>
+      <button class="btn" id="camBtn">pause</button>
+      <a class="btn" id="camFull" target="_blank" rel="noopener">full</a></div>
+    <img id="camImg" alt=""></div>
+
   <div class="card b-chart"><div class="k">TPS [%]</div>
     <canvas id="cTps"></canvas></div>
 
@@ -139,6 +170,18 @@ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     <canvas id="cRpm"></canvas></div>
 
   <div class="card b-events" id="events"><div class="k">EVENTS</div></div>
+
+  <!-- toggled CAN signals land here, as grid items like the charts above -->
+  <div id="plots" style="display:contents"></div>
+
+  <div class="card b-events">
+    <div class="row"><span class="k">CAN SIGNALS</span>
+      <span><label class="btn">LOAD .DBC<input type="file" id="dbcFile" accept=".dbc" hidden></label>
+      <button class="btn" id="dbcBuiltIn" hidden>BUILT-IN</button>
+      <a class="btn" href="/can.dbc" download="ebrake.dbc">SAVE .DBC</a></span></div>
+    <div class="s" id="dbcS">&nbsp;</div><div class="s" id="over"></div>
+    <div id="msgs"></div>
+  </div>
 
 </div>
 
@@ -159,8 +202,9 @@ function fit(c){
   return {x:x,w:r.width,h:r.height};
 }
 
-// data, colour, shaded band [lo,hi], values the axis must always include
-function chart(c,data,col,band,inc){
+// data, colour, shaded band [lo,hi], values the axis must always include,
+// brake state per sample
+function chart(c,data,col,band,inc,brk){
   var g=fit(c), x=g.x, w=g.w, h=g.h, i;
   x.clearRect(0,0,w,h);
   if(!data.length){return}
@@ -178,8 +222,8 @@ function chart(c,data,col,band,inc){
 
   // brake-applied shading, so the chart says when it was braked
   x.fillStyle='rgba(248,81,73,.10)';
-  for(i=0;i<hB.length&&i<data.length;i++){
-    if(hB[i]){ var x0=X(i); x.fillRect(x0,0,Math.max(1,X(i+1)-x0),h) }
+  for(i=0;i<brk.length&&i<data.length;i++){
+    if(brk[i]){ var x0=X(i); x.fillRect(x0,0,Math.max(1,X(i+1)-x0),h) }
   }
 
   if(band){
@@ -216,7 +260,7 @@ function stale(on){
 }
 
 function paint(d){
-  cfg=d;
+  cfg=d; camConfig(d);
   $('link').textContent='LIVE'; $('link').style.color='var(--green)';
   $('sub').textContent='up '+(d.uptime/1000).toFixed(0)+' s   '
     +d.changes+' state changes';
@@ -273,9 +317,236 @@ function paint(d){
 }
 
 function redraw(d){
-  chart($('cTps'),hT,'#4ea3ff',[d.appTh,d.relTh],[0,d.relTh]);
-  chart($('cRpm'),hR,'#3fb950',[-d.rpmTh,d.rpmTh],[-d.rpmTh,d.rpmTh]);
+  chart($('cTps'),hT,'#4ea3ff',[d.appTh,d.relTh],[0,d.relTh],hB);
+  chart($('cRpm'),hR,'#3fb950',[-d.rpmTh,d.rpmTh],[-d.rpmTh,d.rpmTh],hB);
+  redrawSigs();
 }
+
+// ============================================================
+// CAN signals
+// ============================================================
+//
+// The board sends each ID's latest raw bytes and serves its DBC at
+// /can.dbc (CanDbc.h); decoding happens here. A signal is treated as a
+// prediction unless its CM_ comment starts with CONFIRMED, and says so
+// on screen - most of that DBC is inferred from message names.
+//
+// An ID the DBC does not describe still gets toggles, as raw bytes and
+// big-endian 16-bit words, so nothing on the bus is invisible.
+
+function sg(n,st,len,intel,sgn,f,o,u){
+  return {n:n,st:st,len:len,intel:intel,sgn:sgn,f:f,o:o,u:u}}
+
+var COLS=['#d2a8ff','#ff8f4d','#56d4dd','#e3b341','#ff7b72','#7ee787','#79c0ff'];
+var dbc=null, frames={}, H={}, HB={}, sel={}, plots={}, listSig='', RAW={};
+var STALE_MS=1000;   // a frame older than this is no longer a live value
+
+function store(k,v){ try{ localStorage.setItem(k,v) }catch(e){} }
+function load(k){ try{ return localStorage.getItem(k) }catch(e){ return null } }
+
+function parseDbc(text){
+  var names={}, sigs={}, cur=null, n=0, ok=0, m;
+  text.split(/\r?\n/).forEach(function(l){
+    m=l.match(/^BO_\s+(\d+)\s+(\w+)\s*:/);
+    if(m){ cur=+m[1]; names[cur]=m[2]; sigs[cur]=[]; n++; return }
+    m=l.match(/^\s*SG_\s+(\w+)[^:]*:\s*(\d+)\|(\d+)@([01])([+-])\s*\(\s*([^,\s]+)\s*,\s*([^)\s]+)\s*\)\s*\[[^\]]*\]\s*"([^"]*)"/);
+    if(m&&cur!=null) sigs[cur].push(sg(m[1],+m[2],+m[3],m[4]==='1',m[5]==='-',+m[6],+m[7],m[8]));
+  });
+  var re=/CM_\s+SG_\s+(\d+)\s+(\w+)\s+"CONFIRMED/g;
+  while((m=re.exec(text)))(sigs[+m[1]]||[]).forEach(function(g){
+    if(g.n===m[2]){ g.ok=true; ok++ } });
+  return n?{names:names,sigs:sigs,n:n,ok:ok}:null;
+}
+
+// Intel counts up from the LSB; Motorola starts at the MSB and walks the
+// DBC's sawtooth bit numbering. Multiplying keeps 32+ bit signals exact.
+function decode(b,s){
+  var v=0, i, k=s.st;
+  for(i=0;i<s.len;i++){
+    if(s.intel)k=s.st+s.len-1-i;
+    if((k>>3)>=b.length)return NaN;
+    v=v*2+((b[k>>3]>>(k&7))&1);
+    if(!s.intel)k=(k%8===0)?k+15:k-1;
+  }
+  if(s.sgn&&v>=Math.pow(2,s.len-1))v-=Math.pow(2,s.len);
+  return v*s.f+s.o;
+}
+
+function nameOf(id){ return (dbc&&dbc.names[id])||'not in DBC' }
+function sigsOf(id){
+  if(dbc&&dbc.sigs[id]&&dbc.sigs[id].length)return dbc.sigs[id];
+  var f=frames[id]; if(!f)return [];
+  var n=f.d.length/2, k=id+':'+n, i;
+  if(!RAW[k]){
+    var s=[];
+    for(i=0;i<n;i++)s.push(sg('byte'+i,i*8+7,8,0,0,1,0,''));
+    for(i=0;i+1<n;i+=2){
+      s.push(sg('word'+i+'-'+(i+1)+' u16',i*8+7,16,0,0,1,0,''));
+      s.push(sg('word'+i+'-'+(i+1)+' s16',i*8+7,16,0,1,1,0,''));
+    }
+    s.raw=true; RAW[k]=s;
+  }
+  return RAW[k];
+}
+// the CONFIRMED/PREDICTED convention is the built-in DBC's own; a DBC
+// loaded from a file is taken as it is
+function tag(ss,g){ return ss.raw?'raw':(g.ok||dbc.file?'':'predicted') }
+function hex(id){ return '0x'+(id&0x1FFFFFFF).toString(16).toUpperCase()+(id>=0x80000000?' ext':'') }
+function fmt(v){ return isNaN(v)?'--':String(+v.toFixed(3)) }
+function el(t,c,x){ var e=document.createElement(t); if(c)e.className=c;
+  if(x!=null)e.textContent=x; return e }
+
+// rebuilt only when the set of messages changes, so an open <details> and
+// a checkbox mid-tap survive the 250 ms updates
+function buildList(){
+  var ids={}, k;
+  if(dbc)for(k in dbc.names)ids[k]=1;
+  for(k in frames)ids[k]=1;
+  var list=Object.keys(ids).map(Number).sort(function(a,b){return a-b});
+  // received IDs are part of the key: a message's raw toggles only exist
+  // once its first frame has shown how long it is
+  var s=list.join()+'|'+Object.keys(frames).join()+'|'+(dbc?dbc.n:'');
+  if(s===listSig)return; listSig=s;
+
+  var box=$('msgs'); box.textContent='';
+  list.forEach(function(id){
+    var d=el('details'), sm=el('summary');
+    sm.appendChild(el('span','id',hex(id))); sm.appendChild(document.createTextNode(' '+nameOf(id)));
+    d.appendChild(sm);
+    d.appendChild(el('div','meta',frames[id]?'':'never received')).id='m'+id;
+    var ss=sigsOf(id);
+    ss.forEach(function(g){
+      var key=id+':'+g.n, row=el('label','sig'), cb=el('input');
+      cb.type='checkbox'; cb.checked=!!sel[key];
+      cb.onchange=function(){ toggle(key,cb.checked) };
+      row.appendChild(cb); row.appendChild(el('span','',g.n));
+      row.appendChild(el('i','pred',tag(ss,g)));
+      row.appendChild(el('b','','--')).id='v'+key;
+      d.appendChild(row);
+    });
+    box.appendChild(d);
+  });
+  $('dbcS').textContent=!dbc?'loading the DBC from the board'
+    :dbc.file?(dbc.file+' - '+dbc.n+' messages, loaded on this device')
+    :(dbc.n+' messages - '+dbc.ok+' signals confirmed, the rest predicted until checked');
+  $('dbcBuiltIn').hidden=!(dbc&&dbc.file);
+  syncPlots();
+}
+
+function findSig(key){
+  var p=key.indexOf(':'), id=+key.slice(0,p), n=key.slice(p+1);
+  return sigsOf(id).filter(function(g){return g.n===n})[0];
+}
+
+function toggle(key,on){
+  if(on)sel[key]=1; else delete sel[key];
+  store('sel',JSON.stringify(sel));
+  var cb=document.getElementById('v'+key);
+  if(cb)cb.parentNode.firstChild.checked=on;
+  syncPlots();
+}
+
+function syncPlots(){
+  var k, i=0;
+  for(k in plots)if(!sel[k]||!findSig(k)){ plots[k].card.remove(); delete plots[k] }
+  for(k in sel){
+    var g=findSig(k); if(!g||plots[k])continue;
+    var card=el('div','card b-chart'), head=el('div','row'), x=el('button','btn','hide');
+    var id=+k.split(':')[0];
+    var title=el('span','k',hex(id)+' '+nameOf(id)+'  '+g.n+(g.u?' ['+g.u+']':'')+'  ');
+    title.appendChild(el('i','pred',tag(sigsOf(id),g)));
+    head.appendChild(title);
+    var val=el('span','v'); val.style.fontSize='15px'; head.appendChild(val);
+    x.onclick=(function(key){return function(){toggle(key,false)}})(k);
+    head.appendChild(x); card.appendChild(head);
+    var c=el('canvas'); card.appendChild(c);
+    $('plots').appendChild(card);
+    plots[k]={card:card,c:c,val:val};
+  }
+  for(k in plots)plots[k].col=COLS[i++%COLS.length];
+  redrawSigs();
+}
+
+function redrawSigs(){
+  for(var k in plots){
+    var p=plots[k], h=H[k]||[];
+    p.val.textContent=h.length&&!h.stale?fmt(h[h.length-1]):'--';
+    p.val.style.color=p.col;
+    chart(p.c,h,p.col,null,[],HB[k]||[]);
+  }
+}
+
+function paintCan(d){
+  frames={};
+  d.f.forEach(function(f){ frames[f.id]=f });
+  buildList();
+  var brk=hB.length?hB[hB.length-1]:0;
+  for(var id in frames){
+    var f=frames[id], b=[], i;
+    for(i=0;i<f.d.length;i+=2)b.push(parseInt(f.d.substr(i,2),16));
+    var m=$('m'+id);
+    if(m)m.textContent=f.age+' ms ago   x'+f.n+'   '+(f.d.match(/../g)||[]).join(' ');
+    // the board keeps an ID's last payload forever; once it stops arriving
+    // show '--' and stop plotting, rather than draw a flat line that looks live
+    var old=f.age>STALE_MS;
+    sigsOf(+id).forEach(function(g){
+      var key=id+':'+g.n, v=old?NaN:decode(b,g);
+      if(!H[key]){H[key]=[];HB[key]=[]}
+      if(!isNaN(v)){ push(H[key],v); push(HB[key],brk) }
+      H[key].stale=old;
+      var o=document.getElementById('v'+key);
+      if(o)o.textContent=fmt(v)+(g.u&&!isNaN(v)?' '+g.u:'');
+    });
+  }
+  $('over').textContent=d.over?(d.over+' frames from IDs past the board\'s table, not shown'):'';
+  redrawSigs();
+}
+
+// aborted like poll(), so a dead connection after a board reset cannot
+// stall the signal view until the browser's own TCP timeout
+function pollCan(){
+  var ac=new AbortController(), to=setTimeout(function(){ac.abort()},1200);
+  fetch('/api/can',{signal:ac.signal,cache:'no-store'}).then(function(r){return r.json()})
+    .then(paintCan).catch(function(){}).finally(function(){
+      clearTimeout(to); setTimeout(pollCan,250) });
+}
+
+function useDbc(p){ dbc=p; H={}; HB={}; listSig=''; buildList() }
+
+// once per page load, retried until the board answers - unless this device
+// has its own DBC loaded, which then wins
+function loadDbc(){
+  fetch('/can.dbc',{cache:'no-store'}).then(function(r){return r.text()})
+    .then(function(t){ var p=parseDbc(t); if(!p)throw 0;
+      if(!(dbc&&dbc.file))useDbc(p) })
+    .catch(function(){ setTimeout(loadDbc,2000) });
+}
+
+// LOAD .DBC: a DBC from this phone or laptop, decoded here and kept in this
+// browser only. Nothing is sent to the board, which keeps its built-in one.
+function fileDbc(name,text){
+  var p=parseDbc(text); if(!p)return false;
+  p.file=name; useDbc(p); return true;
+}
+$('dbcFile').onchange=function(){
+  var f=this.files[0]; this.value=''; if(!f)return;
+  var r=new FileReader();
+  r.onload=function(){
+    if(!fileDbc(f.name,r.result)){ $('dbcS').textContent=f.name+': no BO_ messages found - not a DBC?'; return }
+    // a big DBC can exceed browser storage; it still works until reload
+    try{ localStorage.setItem('dbcText',r.result); localStorage.setItem('dbcName',f.name) }
+    catch(e){ $('dbcS').textContent+='  (too big to remember - reload it next time)' }
+  };
+  r.readAsText(f);
+};
+$('dbcBuiltIn').onclick=function(){
+  try{ localStorage.removeItem('dbcText'); localStorage.removeItem('dbcName') }catch(e){}
+  dbc=null; loadDbc(); buildList();
+};
+
+try{ sel=JSON.parse(load('sel'))||{} }catch(e){ sel={} }
+buildList();
+if(!(load('dbcText')&&fileDbc(load('dbcName')||'saved.dbc',load('dbcText'))))loadDbc();
 
 function events(list){
   var sig=JSON.stringify(list); if(sig===evSig)return; evSig=sig;
@@ -301,9 +572,10 @@ function poll(){
       setTimeout(poll,150) });
 }
 function pollEvents(){
-  fetch('/api/events',{cache:'no-store'}).then(function(r){return r.json()})
+  var ac=new AbortController(), to=setTimeout(function(){ac.abort()},1200);
+  fetch('/api/events',{signal:ac.signal,cache:'no-store'}).then(function(r){return r.json()})
     .then(events).catch(function(){}).finally(function(){
-      setTimeout(pollEvents,1000) });
+      clearTimeout(to); setTimeout(pollEvents,1000) });
 }
 
 // rotation and window resizes change the canvas size, so redraw from the
@@ -312,5 +584,59 @@ var rt=null;
 window.addEventListener('resize',function(){
   clearTimeout(rt); rt=setTimeout(function(){ if(cfg)redraw(cfg) },120) });
 
-poll(); pollEvents();
+// ============================================================
+// Camera
+// ============================================================
+//
+// Frames come from the camera board (firmware/EBrakeCam) at the address in
+// the status JSON. One JPEG at a time, the next asked for as soon as the
+// last one lands: several phones can watch at once, a slow link just gets
+// fewer frames, and a dead camera is a timeout rather than a frozen image
+// that looks live. The picture is never part of the brake decision.
+
+var camHost=null, camOn=load('cam')!=='0', camAt=0, camT=[];
+
+function camStatus(){
+  var s=$('camS'), im=$('camImg'), age=Date.now()-camAt;
+  $('camBtn').textContent=camOn?'pause':'play';
+  if(!camOn){ s.textContent='paused'; s.style.color='var(--dim)'; im.style.opacity=.35; return }
+  if(camAt&&age<2500){
+    s.textContent=camT.length+' fps'; s.style.color='var(--green)'; im.style.opacity=1;
+  }else{
+    s.textContent=camAt?('NO PICTURE - last frame '+(age/1000).toFixed(0)+' s ago')
+      :('connecting to '+camHost);
+    s.style.color=camAt?'var(--red)':'var(--dim)'; im.style.opacity=.35;
+  }
+}
+
+function pollCam(){
+  if(!camOn||!camHost||document.hidden){ if(camHost)camStatus(); return setTimeout(pollCam,400) }
+  var ac=new AbortController(), to=setTimeout(function(){ac.abort()},2500);
+  fetch('http://'+camHost+'/capture',{signal:ac.signal,cache:'no-store'})
+    .then(function(r){ if(!r.ok)throw 0; return r.blob() })
+    .then(function(b){
+      var im=$('camImg'), old=im.src;
+      im.src=URL.createObjectURL(b);
+      if(old.slice(0,5)==='blob:')URL.revokeObjectURL(old);
+      var now=Date.now(); camAt=now; camT.push(now);
+      while(camT.length&&now-camT[0]>1000)camT.shift();
+    })
+    .catch(function(){})
+    .finally(function(){ clearTimeout(to); camStatus(); setTimeout(pollCam,camAt?30:1500) });
+}
+
+$('camBtn').onclick=function(){
+  camOn=!camOn; store('cam',camOn?'1':'0'); camStatus() };
+
+// the address arrives with the first status document
+function camConfig(d){
+  if(camHost!==null||!d)return;
+  camHost=d.cam||'';
+  if(!camHost)return;
+  $('camCard').hidden=false;
+  $('camFull').href='http://'+camHost+'/';
+  camStatus(); pollCam();
+}
+
+poll(); pollEvents(); pollCan();
 </script></body></html>)rawliteral";

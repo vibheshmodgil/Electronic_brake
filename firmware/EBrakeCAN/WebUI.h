@@ -14,10 +14,10 @@
 // the WiFi stack that Arduino already puts there. The brake loop is the
 // Arduino loopTask, which stays on core 1 with a whole core to itself.
 //
-// So a stalled HTTP request, a phone that drops mid-transfer, five phones
+// So a stalled HTTP request, a phone that drops mid-transfer, four phones
 // polling at once - none of it can delay twai_receive() or the apply
-// timer. The two sides meet only at a spinlocked struct copy of about
-// forty bytes.
+// timer. The two sides meet only under spinlocks: a 48-byte snapshot
+// copy, the event ring, and one 24-byte CAN frame slot at a time.
 //
 // If the access point fails to start, webUiBegin() says so and returns.
 // The controller then runs exactly as it would with the web UI compiled
@@ -26,8 +26,8 @@
 //
 // WHY IT IS READ-ONLY
 // -------------------------------------------------------------------
-// There are three routes: the page, a status document and an event list.
-// All three are GET, and none of them touch the relay, the state machine
+// There are five routes: the page, a status document, an event list, the
+// raw CAN frame table and the DBC. All five are GET, and none of them touch the relay, the state machine
 // or any calibration constant. There is deliberately no endpoint that can
 // release the brake, and adding one would put a WiFi client in the safety
 // path. Do not add one.
@@ -50,6 +50,7 @@
 
 #include "Telemetry.h"
 #include "WebPage.h"
+#include "CanDbc.h"
 
 static WebServer webServer(80);
 static DNSServer dnsServer;
@@ -67,7 +68,7 @@ static void handleStatus()
   BrakeSnapshot s;
   snapshotGet(&s);
 
-  char body[640];
+  char body[700];
 
   snprintf(
       body, sizeof(body),
@@ -78,7 +79,7 @@ static void handleStatus()
       "\"canOk\":%u,\"ageTps\":%ld,\"ageRpm\":%ld,"
       "\"uptime\":%lu,\"changes\":%lu,"
       "\"relTh\":%.2f,\"appTh\":%.2f,\"rpmTh\":%d,"
-      "\"delayMs\":%lu,\"canTimeout\":%lu}",
+      "\"delayMs\":%lu,\"canTimeout\":%lu,\"cam\":\"%s\"}",
       (long)s.rpm, (long)s.s1_mV, (long)s.s2_mV,
       s.tps, s.torque,
       (unsigned)s.relayOn, (unsigned)s.brakeApplied,
@@ -89,7 +90,8 @@ static void handleStatus()
       (double)TPS_APPLY_THRESHOLD_PERCENT,
       (int)RPM_APPLY_THRESHOLD,
       (unsigned long)BRAKE_APPLY_DELAY_MS,
-      (unsigned long)CAN_TIMEOUT_MS);
+      (unsigned long)CAN_TIMEOUT_MS,
+      CAM_HOST);
 
   webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(200, "application/json", body);
@@ -141,6 +143,64 @@ static void handleEvents()
 
   webServer.sendHeader("Cache-Control", "no-store");
   webServer.send(200, "application/json", body);
+}
+
+// ------------------------------------------------------------
+// GET /api/can - latest raw payload of every ID seen
+// ------------------------------------------------------------
+//
+// {"over":..,"f":[{"id":176,"n":812,"age":14,"d":"3C41"},..]}
+// Undecoded on purpose: the page decodes with the DBC it was given.
+//
+static void handleCan()
+{
+  static CanFrameSlot frames[CAN_FRAME_SLOTS];   // off the task stack
+  uint32_t overflow = 0;
+
+  uint8_t n = canFramesSnapshot(frames, &overflow);
+  uint32_t now = millis();
+
+  String body;
+  body.reserve(16 + n * 72);
+
+  body += "{\"over\":";
+  body += overflow;
+  body += ",\"f\":[";
+
+  char item[96];   // worst case 56 + 16 hex + NUL
+
+  for (uint8_t i = 0; i < n; i++)
+  {
+    const CanFrameSlot &f = frames[i];
+
+    int len = snprintf(
+        item, sizeof(item),
+        "%s{\"id\":%lu,\"n\":%lu,\"age\":%lu,\"d\":\"",
+        i ? "," : "",
+        (unsigned long)f.id, (unsigned long)f.count,
+        (unsigned long)(now - f.lastMs));
+
+    for (uint8_t b = 0; b < f.dlc; b++)
+    {
+      len += snprintf(item + len, sizeof(item) - len, "%02X", f.data[b]);
+    }
+
+    body += item;
+    body += "\"}";
+  }
+
+  body += "]}";
+
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json", body);
+}
+
+// The page fetches and decodes with this; opening /can.dbc in a browser,
+// or the page's SAVE .DBC button, saves it as ebrake.dbc.
+static void handleDbc()
+{
+  webServer.sendHeader("Content-Disposition", "attachment; filename=\"ebrake.dbc\"");
+  webServer.send_P(200, "application/octet-stream", CAN_DBC);
 }
 
 static void handleRoot()
@@ -204,6 +264,8 @@ static void webUiBegin()
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/api/status", HTTP_GET, handleStatus);
   webServer.on("/api/events", HTTP_GET, handleEvents);
+  webServer.on("/api/can", HTTP_GET, handleCan);
+  webServer.on("/can.dbc", HTTP_GET, handleDbc);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
 

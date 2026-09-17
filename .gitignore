@@ -2,6 +2,12 @@
 *.csv
 !docs/**/*.csv
 
+# ---- CAN databases ----
+# Load real DBCs in the dashboard with LOAD .DBC instead of committing
+# them - this repository is public.
+*.dbc
+firmware/EBrakeCAN/CanDbc.h
+
 # ---- PlatformIO ----
 .pio/
 .pioenvs/

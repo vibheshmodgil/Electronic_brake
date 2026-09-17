@@ -17,8 +17,9 @@
 // generated prototypes - which means it belongs in a header included at
 // the top of the sketch, not in the sketch body.
 //
-// So: the struct and the two event-buffer sizes live here, because
-// snapshotGet() and eventsSnapshot() name them in their signatures. The
+// So: BrakeSnapshot, CanFrameSlot and the buffer sizes live here, because
+// snapshotGet(), canFramesSnapshot() and eventsSnapshot() name them in
+// their signatures. The
 // storage and the function bodies stay in EBrakeCAN.ino.
 //
 // If you add a function that takes or returns BrakeSnapshot, declare it
@@ -69,8 +70,32 @@ struct BrakeSnapshot
 
 
 // ============================================================
+// Every CAN message seen on the bus, for the web UI's signal view
+// ============================================================
+//
+// The latest payload per ID, nothing decoded. The page decodes it with
+// the DBC in CanDbc.h, so adding a signal only changes that text (it is in
+// flash, so still a reflash). 64 x 24 = 1536 bytes - room above the 48 IDs
+// an earlier bus survey counted. Frames from IDs beyond the table are
+// counted in canFramesOverflow and not shown.
+//
+#define CAN_FRAME_SLOTS 64
+
+struct CanFrameSlot
+{
+  uint32_t id;             // bit 31 set = extended, as a DBC writes it
+  uint32_t count;
+  uint32_t lastMs;
+  uint8_t  dlc;
+  uint8_t  data[8];
+};
+
+
+// ============================================================
 // Defined in EBrakeCAN.ino
 // ============================================================
+
+uint8_t canFramesSnapshot(CanFrameSlot *out, uint32_t *overflow);
 
 void logEvent(const char *message);
 

@@ -7,11 +7,15 @@ firmware/
 ├── platformio.ini                        PlatformIO build config (Mega)
 ├── ElectronicBrake/
 │   └── ElectronicBrake.ino               Mega 2560 build - analogue inputs
-└── EBrakeCAN/
-    ├── EBrakeCAN.ino                     ESP32-S3 build - CAN inputs
-    ├── WebUI.h                           WiFi AP + read-only telemetry server
-    ├── WebPage.h                         the phone/laptop dashboard page
-    └── README.md                         its pins, CAN decoding and constants
+├── EBrakeCAN/
+│   ├── EBrakeCAN.ino                     ESP32-S3 build - CAN inputs
+│   ├── Telemetry.h                       types shared by the brake loop and web UI
+│   ├── CanDbc.example.h                  copy to CanDbc.h (gitignored) after cloning
+│   ├── WebUI.h                           WiFi AP + read-only telemetry server
+│   ├── WebPage.h                         the phone/laptop dashboard page
+│   └── README.md                         its pins, CAN decoding and constants
+└── EBrakeCam/
+    └── EBrakeCam.ino                     ESP32-S3 CAM board - camera for the dashboard
 ```
 
 **Two builds, one braking rule.** Both release the brake on throttle and
